@@ -1,0 +1,55 @@
+# ---------------------------------------------------------
+# Python / build artifacts
+# ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Jupyter junk
+.ipynb_checkpoints/
+*.ipynb_save
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------
+# Project-specific: datasets, checkpoints, results, large artifacts
+# ---------------------------------------------------------
+
+# Entire datasets (Office-Home, Office-31)
+datasets/
+!datasets/.gitkeep  # optional placeholder if you want the folder itself in git
+
+# Checkpoints and model weights
+checkpoints/
+*.pth
+*.pt
+
+# ME-IIS result artifacts
+results/
+*.npz
+*.npy
+
+# Logs / tensorboard
+runs/
+logs/
+*.log
+
+# Large doc drafts
+*.docx
+*.doc
