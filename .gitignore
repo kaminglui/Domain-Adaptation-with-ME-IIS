@@ -9,8 +9,6 @@ __pycache__/
 # Virtual envs
 .venv/
 venv/
-env/
-ENV/
 *.egg-info/
 dist/
 build/
@@ -32,7 +30,9 @@ Thumbs.db
 # ---------------------------------------------------------
 
 # Entire datasets (Office-Home, Office-31)
-datasets/
+datasets/Office-31/
+datasets/Office-Home/
+
 !datasets/.gitkeep  # optional placeholder if you want the folder itself in git
 
 # Checkpoints and model weights
