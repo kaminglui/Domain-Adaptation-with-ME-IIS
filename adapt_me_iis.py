@@ -17,6 +17,7 @@ from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_R
 from eval import evaluate
 from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
+from utils.data_utils import build_loader, make_generator
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.seed_utils import get_device, set_seed
 from torchvision import datasets
@@ -262,6 +263,7 @@ def adapt_me_iis(args) -> None:
         print(f"[DRY RUN] Limiting feature extraction and adaptation to {args.dry_run_max_batches} batches.")
     set_seed(args.seed, deterministic=args.deterministic)
     device = get_device(deterministic=args.deterministic)
+    data_generator = make_generator(args.seed)
     feature_layers = _parse_feature_layers(args.feature_layers)
     components_map = _build_component_map(feature_layers, args.components_per_layer, args.num_latent_styles)
     components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
@@ -333,19 +335,37 @@ def adapt_me_iis(args) -> None:
     model.backbone.load_state_dict(source_ckpt["backbone"])
     model.classifier.load_state_dict(source_ckpt["classifier"])
 
-    target_eval_loader = DataLoader(
-        target_eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    target_eval_loader = build_loader(
+        target_eval_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
     )
     baseline_acc, _ = evaluate(model, target_eval_loader, device)
     print(f"Baseline source-only target acc: {baseline_acc:.2f}")
 
     print("[Audit] Target labels are ignored during IIS and adaptation training.")
     print("[Audit] Target constraint loader uses deterministic transforms (train=False).")
-    source_feat_loader = DataLoader(
-        source_feat_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    source_feat_loader = build_loader(
+        source_feat_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
     )
-    target_feat_loader = DataLoader(
-        target_feat_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+    target_feat_loader = build_loader(
+        target_feat_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
     )
 
     with torch.no_grad():
@@ -378,6 +398,7 @@ def adapt_me_iis(args) -> None:
         num_classes=num_classes,
         layers=list(feature_layers),
         components_per_layer=components_map,
+        random_state=args.seed,
         device=device,
     )
     adapter.fit_target_structure({k: v.to(device) for k, v in target_feats.items()})
@@ -418,11 +439,14 @@ def adapt_me_iis(args) -> None:
     optimizer, scheduler = _make_optimizer_and_scheduler(model)
 
     weighted_source_ds = source_train_ds
-    weighted_loader = DataLoader(
+    weighted_loader = build_loader(
         IndexedDataset(weighted_source_ds),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
     )
     acc = 0.0
     start_epoch = 0

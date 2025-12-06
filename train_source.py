@@ -14,6 +14,7 @@ from tqdm import tqdm
 from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_ROOT, get_domain_loaders
 from eval import evaluate
 from models.classifier import build_model
+from utils.data_utils import build_loader, make_generator
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.seed_utils import get_device, set_seed
 
@@ -110,6 +111,7 @@ def train_source(args) -> None:
         print(f"[DRY RUN] Limiting training to {args.dry_run_max_batches} total batches.")
     set_seed(args.seed, deterministic=args.deterministic)
     device = get_device(deterministic=args.deterministic)
+    data_generator = make_generator(args.seed)
     source_loader, _, target_eval_loader = get_domain_loaders(
         dataset_name=args.dataset_name,
         source_domain=args.source_domain,
@@ -119,6 +121,26 @@ def train_source(args) -> None:
         num_workers=args.num_workers,
         debug_classes=False,
         max_samples_per_domain=args.dry_run_max_samples if args.dry_run_max_samples > 0 else None,
+    )
+    source_ds = source_loader.dataset
+    target_eval_ds = target_eval_loader.dataset
+    source_loader = build_loader(
+        source_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
+    )
+    target_eval_loader = build_loader(
+        target_eval_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        generator=data_generator,
+        drop_last=False,
     )
     print(f"[DEBUG] Built loaders: len(source_loader)={len(source_loader)}, len(target_eval_loader)={len(target_eval_loader)}")
     sys.stdout.flush()

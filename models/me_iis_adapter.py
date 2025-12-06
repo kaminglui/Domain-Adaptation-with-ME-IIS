@@ -52,6 +52,7 @@ class MaxEntAdapter:
         layers: List[str],
         components_per_layer: Dict[str, int],
         device: torch.device = torch.device("cpu"),
+        random_state: Optional[int] = None,
     ):
         self.num_classes = num_classes
         self.layers = layers
@@ -59,9 +60,13 @@ class MaxEntAdapter:
         self.device = device
         self.indexer = ConstraintIndexer(layers, components_per_layer, num_classes)
         self.expected_feature_mass = float(len(layers))
+        self.random_state = random_state
         self.gmms: Dict[str, GaussianMixture] = {
             layer: GaussianMixture(
-                n_components=components_per_layer[layer], covariance_type="diag", reg_covar=1e-6
+                n_components=components_per_layer[layer],
+                covariance_type="diag",
+                reg_covar=1e-6,
+                random_state=random_state,
             )
             for layer in layers
         }
@@ -217,6 +222,7 @@ class MaxEntAdapter:
             ratio = torch.ones_like(current_moments)
             active_mask = (target_moments > eps) | (current_moments > eps)
             ratio[active_mask] = (target_moments[active_mask] + eps) / (current_moments[active_mask] + eps)
+            ratio = torch.clamp(ratio, min=1e-6, max=1e6)
             delta_update = torch.zeros_like(current_moments)
             delta_update[active_mask] = torch.log(ratio[active_mask]) / (mass_constant + eps)
             lambdas = lambdas + delta_update
