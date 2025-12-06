@@ -480,8 +480,8 @@ def adapt_me_iis(args) -> None:
         num_classes=num_classes,
         layers=list(feature_layers),
         components_per_layer=components_map,
-        random_state=args.seed,
         device=device,
+        seed=args.seed,
     )
     adapter.fit_target_structure({k: v.to(device) for k, v in target_feats.items()})
     weights, history = adapter.solve_iis(

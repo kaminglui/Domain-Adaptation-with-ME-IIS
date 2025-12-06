@@ -52,7 +52,7 @@ class MaxEntAdapter:
         layers: List[str],
         components_per_layer: Dict[str, int],
         device: torch.device = torch.device("cpu"),
-        random_state: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         self.num_classes = num_classes
         self.layers = layers
@@ -60,15 +60,18 @@ class MaxEntAdapter:
         self.device = device
         self.indexer = ConstraintIndexer(layers, components_per_layer, num_classes)
         self.expected_feature_mass = float(len(layers))
-        self.random_state = random_state
-        self.gmms: Dict[str, GaussianMixture] = {
+        self.seed = seed
+        self.gmms: Dict[str, GaussianMixture] = self._build_layer_gmms()
+
+    def _build_layer_gmms(self) -> Dict[str, GaussianMixture]:
+        return {
             layer: GaussianMixture(
-                n_components=components_per_layer[layer],
+                n_components=self.components_per_layer[layer],
                 covariance_type="diag",
                 reg_covar=1e-6,
-                random_state=random_state,
+                random_state=self.seed,
             )
-            for layer in layers
+            for layer in self.layers
         }
 
     def _assert_non_negative(self, tensor: torch.Tensor, name: str, atol: float = 1e-8) -> None:
