@@ -5,3 +5,4 @@ pillow
 matplotlib
 pandas
 tensorboard
+kagglehub

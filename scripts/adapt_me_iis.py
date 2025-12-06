@@ -24,6 +24,7 @@ from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
 from utils.data_utils import build_loader, make_generator
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
+from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
 from torchvision import datasets
 
@@ -156,6 +157,69 @@ def _dataset_tag(name: str) -> str:
     return name
 
 
+def _normalize_dataset_name(name: str) -> str:
+    return name.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _resolve_officehome_root_from(base: Path) -> Path:
+    if not base.exists() or not base.is_dir():
+        return base
+    realworld_candidates = ["RealWorld", "Real World", "Real_World", "Real"]
+    candidates = [base] + [p for p in base.iterdir() if p.is_dir()]
+    for cand in candidates:
+        if all((cand / sub).exists() for sub in ["Art", "Clipart", "Product"]) and any(
+            (cand / rw).exists() for rw in realworld_candidates
+        ):
+            return cand
+    return base
+
+
+def _resolve_office31_root_from(base: Path) -> Path:
+    if not base.exists() or not base.is_dir():
+        return base
+    candidates = [base] + [p for p in base.iterdir() if p.is_dir()]
+    for cand in candidates:
+        if all((cand / sub).exists() for sub in ["amazon", "dslr", "webcam"]):
+            return cand
+    return base
+
+
+def _maybe_resolve_data_root(args) -> str:
+    if args.data_root:
+        explicit = Path(args.data_root)
+        if explicit.exists():
+            return str(explicit)
+        print(f"[DATA][WARN] Provided data_root does not exist: {explicit}. Falling back to defaults.")
+
+    name = _normalize_dataset_name(args.dataset_name)
+
+    if is_colab():
+        try:
+            import kagglehub  # type: ignore
+        except ImportError:
+            import os
+
+            os.system("pip install kagglehub")  # best-effort install in Colab
+            import kagglehub  # type: ignore
+
+        if name == "officehome":
+            root_path = Path(kagglehub.dataset_download("lhrrraname/officehome"))
+            root_path = _resolve_officehome_root_from(root_path)
+        elif name == "office31":
+            root_path = Path(kagglehub.dataset_download("xixuhu/office31"))
+            root_path = _resolve_office31_root_from(root_path)
+        else:
+            raise ValueError(f"Unknown dataset_name '{args.dataset_name}' for KaggleHub resolution.")
+        print(f"[DATA] Resolved dataset '{args.dataset_name}' via KaggleHub at: {root_path}")
+        return str(root_path)
+
+    if name == "officehome":
+        return str(Path(DEFAULT_OFFICE_HOME_ROOT))
+    if name == "office31":
+        return str(Path(DEFAULT_OFFICE31_ROOT))
+    raise ValueError(f"Unknown dataset_name '{args.dataset_name}'. Expected 'office_home' or 'office31'.")
+
+
 def _class_probs_from_logits(
     logits: torch.Tensor, labels: torch.Tensor, mode: str, num_classes: int
 ) -> torch.Tensor:
@@ -260,6 +324,7 @@ def save_iis_history(path: Path, weights: torch.Tensor, history: List[IISIterati
 
 
 def adapt_me_iis(args) -> None:
+    args.data_root = _maybe_resolve_data_root(args)
     data_root = Path(args.data_root) if args.data_root else None
     if data_root is not None and not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
@@ -274,6 +339,10 @@ def adapt_me_iis(args) -> None:
     components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
     total_components = sum(components_map.values())
     layer_tag = "-".join(feature_layers)
+    adapt_ckpt_path = _build_adapt_ckpt_path(args, layer_tag)
+    if getattr(args, "resume_adapt_from", None) in (None, "") and adapt_ckpt_path.exists():
+        args.resume_adapt_from = str(adapt_ckpt_path)
+        print(f"[CKPT] Auto-resume: found existing ME-IIS checkpoint at {adapt_ckpt_path}")
     print(
         f"[Config] dataset={args.dataset_name} layers={layer_tag} components_per_layer={components_str} "
         f"finetune_backbone={args.finetune_backbone} backbone_lr_scale={args.backbone_lr_scale} "
