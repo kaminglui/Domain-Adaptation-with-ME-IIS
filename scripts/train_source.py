@@ -9,7 +9,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from tqdm.notebook import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_ROOT, get_domain_loaders
 from eval import evaluate
@@ -158,6 +163,8 @@ def train_source(args) -> None:
         return opt, sched
 
     optimizer, scheduler = _make_optimizer_and_scheduler(model)
+    writer = SummaryWriter(log_dir="runs/source_only")
+    log_dir = writer.log_dir
 
     start_epoch = 0
     last_completed_epoch = -1
@@ -226,86 +233,93 @@ def train_source(args) -> None:
         f"dry_run_max_batches={args.dry_run_max_batches}"
     )
     sys.stdout.flush()
-    for epoch in range(start_epoch, args.num_epochs):
-        remaining_batches = 0
-        if args.dry_run_max_batches > 0:
-            remaining_batches = max(args.dry_run_max_batches - num_batches_seen, 0)
-            if remaining_batches == 0:
-                print("[DRY RUN] Reached batch budget; stopping training loop early.")
-                break
-        print(f"[TRAIN] Entering epoch {epoch + 1}/{args.num_epochs}")
-        sys.stdout.flush()
-        loss, acc, batches_used = train_one_epoch(
-            model, source_loader, optimizer, device, max_batches=remaining_batches
-        )
-        num_batches_seen += batches_used
-        scheduler.step()
-        target_acc, _ = evaluate(model, target_eval_loader, device)
-        best_target_acc = max(best_target_acc, target_acc)
-        final_source_acc = acc
-        last_completed_epoch = epoch
-        print(
-            f"Epoch {epoch+1}/{args.num_epochs} | Loss {loss:.4f} | "
-            f"Source Acc {acc:.2f} | Target Acc {target_acc:.2f}"
-        )
-        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            epoch_ckpt_path = (
-                Path("checkpoints")
-                / f"source_only_{args.source_domain}_to_{args.target_domain}_seed{args.seed}_epoch{epoch+1}.pth"
+    try:
+        for epoch in tqdm(range(start_epoch, args.num_epochs), desc="Epoch", leave=True):
+            remaining_batches = 0
+            if args.dry_run_max_batches > 0:
+                remaining_batches = max(args.dry_run_max_batches - num_batches_seen, 0)
+                if remaining_batches == 0:
+                    print("[DRY RUN] Reached batch budget; stopping training loop early.")
+                    break
+            print(f"[TRAIN] Entering epoch {epoch + 1}/{args.num_epochs}")
+            sys.stdout.flush()
+            loss, acc, batches_used = train_one_epoch(
+                model, source_loader, optimizer, device, max_batches=remaining_batches
             )
-            checkpoint = {
-                "backbone": model.backbone.state_dict(),
-                "classifier": model.classifier.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": last_completed_epoch,
-                "best_target_acc": best_target_acc,
-                "source_acc": final_source_acc,
-                "args": vars(args),
-            }
-            _save_checkpoint_safe(checkpoint, epoch_ckpt_path)
-        if args.dry_run_max_batches > 0 and num_batches_seen >= args.dry_run_max_batches:
-            print("[DRY RUN] Exhausted batch budget; exiting after this epoch.")
-            break
+            num_batches_seen += batches_used
+            scheduler.step()
+            target_acc, _ = evaluate(model, target_eval_loader, device)
+            best_target_acc = max(best_target_acc, target_acc)
+            final_source_acc = acc
+            last_completed_epoch = epoch
+            writer.add_scalar("Loss/train", loss, epoch)
+            writer.add_scalar("Accuracy/source", acc, epoch)
+            writer.add_scalar("Accuracy/target", target_acc, epoch)
+            print(
+                f"Epoch {epoch+1}/{args.num_epochs} | Loss {loss:.4f} | "
+                f"Source Acc {acc:.2f} | Target Acc {target_acc:.2f}"
+            )
+            if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+                epoch_ckpt_path = (
+                    Path("checkpoints")
+                    / f"source_only_{args.source_domain}_to_{args.target_domain}_seed{args.seed}_epoch{epoch+1}.pth"
+                )
+                checkpoint = {
+                    "backbone": model.backbone.state_dict(),
+                    "classifier": model.classifier.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": last_completed_epoch,
+                    "best_target_acc": best_target_acc,
+                    "source_acc": final_source_acc,
+                    "args": vars(args),
+                }
+                _save_checkpoint_safe(checkpoint, epoch_ckpt_path)
+            if args.dry_run_max_batches > 0 and num_batches_seen >= args.dry_run_max_batches:
+                print("[DRY RUN] Exhausted batch budget; exiting after this epoch.")
+                break
 
-    print("[TRAIN] Finished training loop, preparing checkpoint...")
-    sys.stdout.flush()
-    ckpt_path = _build_source_ckpt_path(args)
-    checkpoint = {
-        "backbone": model.backbone.state_dict(),
-        "classifier": model.classifier.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "epoch": last_completed_epoch,
-        "best_target_acc": best_target_acc,
-        "source_acc": final_source_acc,
-        "args": vars(args),
-    }
-    _save_checkpoint_safe(checkpoint, ckpt_path)
-    dataset_field = _dataset_tag(args.dataset_name)
-    append_csv(
-        path="results/office_home_me_iis.csv",
-        fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
-        row={
-            "dataset": dataset_field,
-            "source": args.source_domain,
-            "target": args.target_domain,
-            "seed": args.seed,
-            "method": "source_only",
-            "target_acc": round(best_target_acc, 4),
-            "source_acc": round(final_source_acc, 4),
-            "num_latent": 0,
-            "layers": "",
-            "components_per_layer": "",
-            "iis_iters": 0,
-            "iis_tol": 0.0,
-            "adapt_epochs": args.num_epochs,
-            "finetune_backbone": True,
-            "backbone_lr_scale": 1.0,
-            "classifier_lr": args.lr_classifier,
-            "source_prob_mode": "",
-        },
-    )
+        print("[TRAIN] Finished training loop, preparing checkpoint...")
+        sys.stdout.flush()
+        ckpt_path = _build_source_ckpt_path(args)
+        checkpoint = {
+            "backbone": model.backbone.state_dict(),
+            "classifier": model.classifier.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": last_completed_epoch,
+            "best_target_acc": best_target_acc,
+            "source_acc": final_source_acc,
+            "args": vars(args),
+        }
+        _save_checkpoint_safe(checkpoint, ckpt_path)
+        dataset_field = _dataset_tag(args.dataset_name)
+        append_csv(
+            path="results/office_home_me_iis.csv",
+            fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
+            row={
+                "dataset": dataset_field,
+                "source": args.source_domain,
+                "target": args.target_domain,
+                "seed": args.seed,
+                "method": "source_only",
+                "target_acc": round(best_target_acc, 4),
+                "source_acc": round(final_source_acc, 4),
+                "num_latent": 0,
+                "layers": "",
+                "components_per_layer": "",
+                "iis_iters": 0,
+                "iis_tol": 0.0,
+                "adapt_epochs": args.num_epochs,
+                "finetune_backbone": True,
+                "backbone_lr_scale": 1.0,
+                "classifier_lr": args.lr_classifier,
+                "source_prob_mode": "",
+            },
+        )
+    finally:
+        writer.close()
+        print(f"[TENSORBOARD] Logs written to {log_dir}")
 
 
 def parse_args():

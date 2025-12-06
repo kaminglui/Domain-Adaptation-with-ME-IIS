@@ -6,8 +6,8 @@ from unittest import mock
 
 import torch
 
-import adapt_me_iis
-import train_source
+import scripts.adapt_me_iis as adapt_me_iis
+import scripts.train_source as train_source
 from datasets.domain_loaders import get_domain_loaders
 from models.me_iis_adapter import MaxEntAdapter
 from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
@@ -115,9 +115,9 @@ class TestEndToEndDryRun(unittest.TestCase):
                 dry_run_max_samples=4,
             )
             with temporary_workdir(workdir):
-                with mock.patch("train_source.build_model", build_tiny_model), mock.patch(
-                    "train_source.tqdm", lambda iterable, **_: iterable
-                ), mock.patch("train_source.sys.stdout.flush", lambda: None):
+                with mock.patch("scripts.train_source.build_model", build_tiny_model), mock.patch(
+                    "scripts.train_source.tqdm", lambda iterable, **_: iterable
+                ), mock.patch("scripts.train_source.sys.stdout.flush", lambda: None):
                     train_source.train_source(source_args)
 
             final_ckpt = workdir / "checkpoints" / "source_only_Ar_to_Cl_seed0.pth"
@@ -151,11 +151,11 @@ class TestEndToEndDryRun(unittest.TestCase):
             )
             with temporary_workdir(workdir):
                 patchers = [
-                    mock.patch("adapt_me_iis.build_model", build_tiny_model),
-                    mock.patch("adapt_me_iis.tqdm", lambda iterable, **_: iterable),
-                    mock.patch("adapt_me_iis._append_csv_safe", lambda *_, **__: None),
-                    mock.patch("adapt_me_iis._save_npz_safe", lambda *_, **__: None),
-                    mock.patch("adapt_me_iis.sys.stdout.flush", lambda: None),
+                    mock.patch("scripts.adapt_me_iis.build_model", build_tiny_model),
+                    mock.patch("scripts.adapt_me_iis.tqdm", lambda iterable, **_: iterable),
+                    mock.patch("scripts.adapt_me_iis._append_csv_safe", lambda *_, **__: None),
+                    mock.patch("scripts.adapt_me_iis._save_npz_safe", lambda *_, **__: None),
+                    mock.patch("scripts.adapt_me_iis.sys.stdout.flush", lambda: None),
                 ]
                 with patchers[0], patchers[1], patchers[2], patchers[3], patchers[4]:
                     adapt_me_iis.adapt_me_iis(adapt_args)

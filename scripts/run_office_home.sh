@@ -13,7 +13,7 @@ run_pair() {
   TGT=$2
   for SEED in "${SEEDS[@]}"; do
     echo "Running ${SRC}->${TGT} seed ${SEED}"
-    python train_source.py \
+    python scripts/train_source.py \
       --data_root "${DATA_ROOT}" \
       --source_domain "${SRC}" \
       --target_domain "${TGT}" \
@@ -23,7 +23,7 @@ run_pair() {
       --seed "${SEED}"
 
     CKPT="checkpoints/source_only_${SRC}_to_${TGT}_seed${SEED}.pth"
-    python adapt_me_iis.py \
+    python scripts/adapt_me_iis.py \
       --data_root "${DATA_ROOT}" \
       --source_domain "${SRC}" \
       --target_domain "${TGT}" \

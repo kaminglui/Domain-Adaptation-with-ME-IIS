@@ -6,8 +6,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-import adapt_me_iis
-import train_source
+import scripts.adapt_me_iis as adapt_me_iis
+import scripts.train_source as train_source
 from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
 
 
@@ -29,7 +29,7 @@ def _run_compile() -> None:
 
 
 def _run_sanity_script() -> None:
-    subprocess.run([sys.executable, "test_me_iis_sanity.py"], check=True)
+    subprocess.run([sys.executable, "scripts/test_me_iis_sanity.py"], check=True)
 
 
 def _source_args(data_root: Path) -> argparse.Namespace:
@@ -90,7 +90,7 @@ def _run_dry_runs() -> None:
 
         source_args = _source_args(data_root)
         with temporary_workdir(workdir):
-            with mock.patch("train_source.build_model", build_tiny_model):
+            with mock.patch("scripts.train_source.build_model", build_tiny_model):
                 train_source.train_source(source_args)
         ckpt = workdir / "checkpoints" / "source_only_Ar_to_Cl_seed0.pth"
         if not ckpt.exists():
@@ -98,7 +98,7 @@ def _run_dry_runs() -> None:
 
         adapt_args = _adapt_args(data_root, checkpoint=ckpt)
         with temporary_workdir(workdir):
-            with mock.patch("adapt_me_iis.build_model", build_tiny_model):
+            with mock.patch("scripts.adapt_me_iis.build_model", build_tiny_model):
                 adapt_me_iis.adapt_me_iis(adapt_args)
         adapt_ckpt = workdir / "checkpoints" / "me_iis_Ar_to_Cl_layer3-layer4_seed0.pth"
         if not adapt_ckpt.exists():

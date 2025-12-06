@@ -11,7 +11,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, Subset
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from tqdm.notebook import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_ROOT, get_domain_loaders
 from eval import evaluate
@@ -528,65 +533,78 @@ def adapt_me_iis(args) -> None:
             "args": vars(args),
         }
 
-    for epoch in range(start_epoch, args.adapt_epochs):
-        remaining_batches = 0
-        if args.dry_run_max_batches > 0:
-            remaining_batches = max(args.dry_run_max_batches - adapt_batches_seen, 0)
-            if remaining_batches == 0:
-                print("[DRY RUN] Reached adaptation batch budget; stopping early.")
+    writer = SummaryWriter(log_dir="runs/adapt_me_iis")
+    log_dir = writer.log_dir
+    try:
+        for epoch in tqdm(range(start_epoch, args.adapt_epochs), desc="Adapt Epoch", leave=True):
+            remaining_batches = 0
+            if args.dry_run_max_batches > 0:
+                remaining_batches = max(args.dry_run_max_batches - adapt_batches_seen, 0)
+                if remaining_batches == 0:
+                    print("[DRY RUN] Reached adaptation batch budget; stopping early.")
+                    break
+            loss, acc, batches_used = weighted_train(
+                model, weighted_loader, weights, optimizer, device, max_batches=remaining_batches
+            )
+            adapt_batches_seen += batches_used
+            scheduler.step()
+            target_acc, _ = evaluate(model, target_eval_loader, device)
+            writer.add_scalar("Loss/adapt", loss, epoch)
+            writer.add_scalar("Accuracy/source", acc, epoch)
+            writer.add_scalar("Accuracy/target", target_acc, epoch)
+            print(
+                f"[Adapt] Epoch {epoch+1}/{args.adapt_epochs} | Loss {loss:.4f} | "
+                f"Source Acc {acc:.2f} | Target Acc {target_acc:.2f}"
+            )
+            last_completed_epoch = epoch
+            if args.save_adapt_every > 0 and (epoch + 1) % args.save_adapt_every == 0:
+                epoch_ckpt = _build_adapt_ckpt_path(args, layer_tag, epoch=epoch + 1)
+                _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), epoch_ckpt)
+            if args.dry_run_max_batches > 0 and adapt_batches_seen >= args.dry_run_max_batches:
+                print("[DRY RUN] Exhausted adaptation batch budget; exiting after this epoch.")
                 break
-        loss, acc, batches_used = weighted_train(
-            model, weighted_loader, weights, optimizer, device, max_batches=remaining_batches
+
+        adapted_acc, _ = evaluate(model, target_eval_loader, device)
+        print(f"Adapted target acc: {adapted_acc:.2f}")
+        final_moment_err = history[-1].max_moment_error if history else float("nan")
+        final_entropy = history[-1].weight_entropy if history else float("nan")
+        print(
+            f"[Summary] Baseline target acc: {baseline_acc:.2f} | Adapted target acc: {adapted_acc:.2f} | "
+            f"Max IIS moment err: {final_moment_err:.4e} | Entropy H(Q): {final_entropy:.4f} | "
+            f"Layers={layer_tag} comps={components_str}"
         )
-        adapt_batches_seen += batches_used
-        scheduler.step()
-        print(f"[Adapt] Epoch {epoch+1}/{args.adapt_epochs} | Loss {loss:.4f} | Source Acc {acc:.2f}")
-        last_completed_epoch = epoch
-        if args.save_adapt_every > 0 and (epoch + 1) % args.save_adapt_every == 0:
-            epoch_ckpt = _build_adapt_ckpt_path(args, layer_tag, epoch=epoch + 1)
-            _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), epoch_ckpt)
-        if args.dry_run_max_batches > 0 and adapt_batches_seen >= args.dry_run_max_batches:
-            print("[DRY RUN] Exhausted adaptation batch budget; exiting after this epoch.")
-            break
 
-    adapted_acc, _ = evaluate(model, target_eval_loader, device)
-    print(f"Adapted target acc: {adapted_acc:.2f}")
-    final_moment_err = history[-1].max_moment_error if history else float("nan")
-    final_entropy = history[-1].weight_entropy if history else float("nan")
-    print(
-        f"[Summary] Baseline target acc: {baseline_acc:.2f} | Adapted target acc: {adapted_acc:.2f} | "
-        f"Max IIS moment err: {final_moment_err:.4e} | Entropy H(Q): {final_entropy:.4f} | "
-        f"Layers={layer_tag} comps={components_str}"
-    )
+        adapt_ckpt = _build_adapt_ckpt_path(args, layer_tag)
+        _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), adapt_ckpt)
 
-    adapt_ckpt = _build_adapt_ckpt_path(args, layer_tag)
-    _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), adapt_ckpt)
-
-    dataset_field = _dataset_tag(args.dataset_name)
-    _append_csv_safe(
-        row={
-            "dataset": dataset_field,
-            "source": args.source_domain,
-            "target": args.target_domain,
-            "seed": args.seed,
-            "method": "me_iis",
-            "target_acc": round(adapted_acc, 4),
-            "source_acc": round(acc, 4),
-            "num_latent": total_components,
-            "layers": layer_tag,
-            "components_per_layer": components_str,
-            "iis_iters": args.iis_iters,
-            "iis_tol": args.iis_tol,
-            "adapt_epochs": args.adapt_epochs,
-            "finetune_backbone": args.finetune_backbone,
-            "backbone_lr_scale": args.backbone_lr_scale,
-            "classifier_lr": args.classifier_lr,
-            "source_prob_mode": args.source_prob_mode,
-        },
-        path=Path("results/office_home_me_iis.csv"),
-        fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
-    )
-    print("[ADAPT] Weighted adaptation complete.")
+        dataset_field = _dataset_tag(args.dataset_name)
+        _append_csv_safe(
+            row={
+                "dataset": dataset_field,
+                "source": args.source_domain,
+                "target": args.target_domain,
+                "seed": args.seed,
+                "method": "me_iis",
+                "target_acc": round(adapted_acc, 4),
+                "source_acc": round(acc, 4),
+                "num_latent": total_components,
+                "layers": layer_tag,
+                "components_per_layer": components_str,
+                "iis_iters": args.iis_iters,
+                "iis_tol": args.iis_tol,
+                "adapt_epochs": args.adapt_epochs,
+                "finetune_backbone": args.finetune_backbone,
+                "backbone_lr_scale": args.backbone_lr_scale,
+                "classifier_lr": args.classifier_lr,
+                "source_prob_mode": args.source_prob_mode,
+            },
+            path=Path("results/office_home_me_iis.csv"),
+            fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
+        )
+        print("[ADAPT] Weighted adaptation complete.")
+    finally:
+        writer.close()
+        print(f"[TENSORBOARD] Logs written to {log_dir}")
 
 
 def parse_args():
