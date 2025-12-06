@@ -110,6 +110,25 @@ class IndexedDataset(Dataset):
         return image, label, idx
 
 
+class PseudoLabeledDataset(Subset):
+    """Subset wrapper that replaces labels with provided pseudo labels."""
+
+    def __init__(self, base_dataset: Dataset, indices: List[int], pseudo_labels: List[int]):
+        super().__init__(base_dataset, indices)
+        if len(indices) != len(pseudo_labels):
+            raise ValueError("Length of indices and pseudo_labels must match.")
+        self.pseudo_labels = [int(l) for l in pseudo_labels]
+
+    def __getitem__(self, idx):
+        image, _ = super().__getitem__(idx)
+        label = self.pseudo_labels[idx]
+        if not torch.is_tensor(label):
+            label = torch.tensor(label, dtype=torch.long)
+        else:
+            label = label.to(dtype=torch.long)
+        return image, label
+
+
 def _parse_feature_layers(layer_str: str) -> Tuple[str, ...]:
     layers = tuple([l.strip() for l in layer_str.split(",") if l.strip()])
     if not layers:
@@ -240,6 +259,63 @@ def _class_probs_from_logits(
 
 
 @torch.no_grad()
+def build_pseudo_label_dataset(
+    model: nn.Module,
+    target_loader: DataLoader,
+    device: torch.device,
+    conf_thresh: float,
+    max_ratio: float,
+    num_source_samples: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Generate pseudo labels for target samples with confidence above conf_thresh.
+    Returns indices relative to target_loader.dataset and corresponding labels.
+    """
+    was_training = model.training
+    model.eval()
+    candidates: List[Tuple[float, int, int]] = []
+
+    max_keep = None
+    if max_ratio >= 0:
+        max_keep = int(max_ratio * float(num_source_samples))
+        if max_keep <= 0:
+            if was_training:
+                model.train()
+            return [], []
+
+    running_idx = 0
+    for batch in target_loader:
+        if len(batch) == 2:
+            images, _ = batch
+        else:
+            images = batch[0]
+        images = images.to(device)
+        logits, _ = model(images, return_features=False)
+        probs = F.softmax(logits, dim=1)
+        max_prob, pred = probs.max(dim=1)
+        bs = images.size(0)
+        for i in range(bs):
+            dataset_idx = running_idx + i
+            if float(max_prob[i].item()) >= conf_thresh:
+                candidates.append((float(max_prob[i].item()), dataset_idx, int(pred[i].item())))
+        running_idx += bs
+
+    if was_training:
+        model.train()
+
+    if not candidates:
+        return [], []
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if max_keep is not None and max_keep > 0:
+        candidates = candidates[:max_keep]
+
+    pseudo_indices = [c[1] for c in candidates]
+    pseudo_labels = [c[2] for c in candidates]
+    return pseudo_indices, pseudo_labels
+
+
+@torch.no_grad()
 def extract_layer_features(
     model: nn.Module,
     loader: DataLoader,
@@ -276,6 +352,77 @@ def extract_layer_features(
     return layer_feats, logits_all, labels_all
 
 
+def adapt_epoch(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    source_loader: DataLoader,
+    source_weights_vec: torch.Tensor,
+    device: torch.device,
+    max_batches: int = 0,
+    pseudo_loader: Optional[DataLoader] = None,
+    pseudo_loss_weight: float = 1.0,
+) -> Tuple[float, float, int, int, int]:
+    """
+    One adaptation epoch combining weighted source loss with optional pseudo-labeled target loss.
+    Returns average loss, source accuracy, batches seen, pseudo samples used, and pseudo samples available.
+    """
+    model.train()
+    total_loss, total_acc, total_src = 0.0, 0.0, 0
+    batches_seen = 0
+    pseudo_used = 0
+    pseudo_total = len(pseudo_loader.dataset) if pseudo_loader is not None else 0
+    pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
+
+    for images, labels, idxs in tqdm(source_loader, desc="Adapt", leave=False):
+        if max_batches > 0 and batches_seen >= max_batches:
+            break
+        images = images.to(device)
+        labels = labels.to(device)
+        batch_weights = source_weights_vec[idxs].to(device)
+
+        pseudo_batch = None
+        if pseudo_iter is not None:
+            try:
+                pseudo_batch = next(pseudo_iter)
+            except StopIteration:
+                pseudo_iter = None
+                pseudo_batch = None
+
+        optimizer.zero_grad()
+        logits, _ = model(images, return_features=False)
+        ce = F.cross_entropy(logits, labels, reduction="none")
+        loss_src = (batch_weights * ce).sum() / (batch_weights.sum() + 1e-8)
+
+        pseudo_loss = torch.tensor(0.0, device=device)
+        pseudo_bs = 0
+        if pseudo_batch is not None:
+            images_tgt, labels_tgt = pseudo_batch
+            images_tgt = images_tgt.to(device)
+            labels_tgt = labels_tgt.to(device)
+            logits_tgt, _ = model(images_tgt, return_features=False)
+            pseudo_loss = F.cross_entropy(logits_tgt, labels_tgt)
+            pseudo_bs = labels_tgt.size(0)
+            pseudo_used += pseudo_bs
+
+        loss = loss_src + pseudo_loss_weight * pseudo_loss
+        loss.backward()
+        optimizer.step()
+
+        bs = labels.size(0)
+        acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
+        total_loss += loss.item() * (bs + pseudo_bs)
+        total_acc += acc * bs
+        total_src += bs
+        batches_seen += 1
+        if max_batches > 0 and batches_seen >= max_batches:
+            break
+
+    denom = total_src + pseudo_used if (pseudo_loader is not None and (total_src + pseudo_used) > 0) else total_src
+    avg_loss = total_loss / denom if denom > 0 else 0.0
+    src_acc = total_acc / total_src if total_src > 0 else 0.0
+    return avg_loss, src_acc, batches_seen, pseudo_used, pseudo_total
+
+
 def weighted_train(
     model: nn.Module,
     loader: DataLoader,
@@ -284,30 +431,17 @@ def weighted_train(
     device: torch.device,
     max_batches: int = 0,
 ) -> Tuple[float, float, int]:
-    model.train()
-    total_loss, total_acc, total = 0.0, 0.0, 0
-    batches_seen = 0
-    for images, labels, idxs in tqdm(loader, desc="Adapt", leave=False):
-        images = images.to(device)
-        labels = labels.to(device)
-        batch_weights = weights[idxs].to(device)
-        optimizer.zero_grad()
-        logits, _ = model(images, return_features=False)
-        ce = F.cross_entropy(logits, labels, reduction="none")
-        loss = (batch_weights * ce).sum() / (batch_weights.sum() + 1e-8)
-        loss.backward()
-        optimizer.step()
-        bs = labels.size(0)
-        acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
-        total_loss += loss.item() * bs
-        total_acc += acc * bs
-        total += bs
-        batches_seen += 1
-        if max_batches > 0 and batches_seen >= max_batches:
-            break
-    if total == 0:
-        return 0.0, 0.0, batches_seen
-    return total_loss / total, total_acc / total, batches_seen
+    loss, acc, batches, _, _ = adapt_epoch(
+        model=model,
+        optimizer=optimizer,
+        source_loader=loader,
+        source_weights_vec=weights,
+        device=device,
+        max_batches=max_batches,
+        pseudo_loader=None,
+        pseudo_loss_weight=1.0,
+    )
+    return loss, acc, batches
 
 
 def save_iis_history(path: Path, weights: torch.Tensor, history: List[IISIterationStats]) -> None:
@@ -356,6 +490,8 @@ def adapt_me_iis(args) -> None:
         f"finetune_backbone={args.finetune_backbone} backbone_lr_scale={args.backbone_lr_scale} "
         f"classifier_lr={args.classifier_lr} source_prob_mode={args.source_prob_mode} "
         f"iis_iters={args.iis_iters} iis_tol={args.iis_tol} "
+        f"gmm_selection_mode={args.gmm_selection_mode} bic_range=[{args.gmm_bic_min_components},"
+        f"{args.gmm_bic_max_components}] "
         f"dry_run_max_samples={args.dry_run_max_samples} dry_run_max_batches={args.dry_run_max_batches}"
     )
     print(
@@ -482,8 +618,15 @@ def adapt_me_iis(args) -> None:
         components_per_layer=components_map,
         device=device,
         seed=args.seed,
+        gmm_selection_mode=args.gmm_selection_mode,
+        gmm_bic_min_components=args.gmm_bic_min_components,
+        gmm_bic_max_components=args.gmm_bic_max_components,
     )
     adapter.fit_target_structure({k: v.to(device) for k, v in target_feats.items()})
+    components_map = dict(adapter.components_per_layer)
+    components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
+    total_components = sum(components_map.values())
+    print(f"[GMM] Final components_per_layer after selection: {components_str}")
     weights, history = adapter.solve_iis(
         source_layer_feats={k: v.to(device) for k, v in source_feats.items()},
         source_class_probs=source_probs,
@@ -530,6 +673,30 @@ def adapt_me_iis(args) -> None:
         generator=data_generator,
         drop_last=False,
     )
+    pseudo_loader: Optional[DataLoader] = None
+    if args.use_pseudo_labels:
+        pseudo_indices, pseudo_labels = build_pseudo_label_dataset(
+            model=model,
+            target_loader=target_feat_loader,
+            device=device,
+            conf_thresh=args.pseudo_conf_thresh,
+            max_ratio=args.pseudo_max_ratio,
+            num_source_samples=len(weighted_source_ds),
+        )
+        if len(pseudo_indices) > 0:
+            pseudo_ds = PseudoLabeledDataset(target_feat_loader.dataset, pseudo_indices, pseudo_labels)
+            pseudo_loader = build_loader(
+                pseudo_ds,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                seed=args.seed,
+                generator=data_generator,
+                drop_last=False,
+            )
+            print(f"[PL] Using {len(pseudo_indices)} pseudo-labelled target samples with conf_thresh={args.pseudo_conf_thresh}.")
+        else:
+            print("[PL] No pseudo-labelled target samples passed the confidence threshold.")
     acc = 0.0
     start_epoch = 0
     last_completed_epoch = -1
@@ -620,8 +787,15 @@ def adapt_me_iis(args) -> None:
                 if remaining_batches == 0:
                     print("[DRY RUN] Reached adaptation batch budget; stopping early.")
                     break
-            loss, acc, batches_used = weighted_train(
-                model, weighted_loader, weights, optimizer, device, max_batches=remaining_batches
+            loss, acc, batches_used, pseudo_used, pseudo_total = adapt_epoch(
+                model=model,
+                optimizer=optimizer,
+                source_loader=weighted_loader,
+                source_weights_vec=weights,
+                device=device,
+                max_batches=remaining_batches,
+                pseudo_loader=pseudo_loader,
+                pseudo_loss_weight=args.pseudo_loss_weight,
             )
             adapt_batches_seen += batches_used
             scheduler.step()
@@ -629,9 +803,13 @@ def adapt_me_iis(args) -> None:
             writer.add_scalar("Loss/adapt", loss, epoch)
             writer.add_scalar("Accuracy/source", acc, epoch)
             writer.add_scalar("Accuracy/target", target_acc, epoch)
+            pseudo_frac = pseudo_used / pseudo_total if pseudo_total > 0 else 0.0
+            if pseudo_total > 0:
+                writer.add_scalar("Pseudo/fraction_used", pseudo_frac, epoch)
             print(
                 f"[Adapt] Epoch {epoch+1}/{args.adapt_epochs} | Loss {loss:.4f} | "
-                f"Source Acc {acc:.2f} | Target Acc {target_acc:.2f}"
+                f"Source Acc {acc:.2f} | Target Acc {target_acc:.2f} | "
+                f"Pseudo frac {pseudo_frac:.2f} (w={args.pseudo_loss_weight:.2f})"
             )
             last_completed_epoch = epoch
             if args.save_adapt_every > 0 and (epoch + 1) % args.save_adapt_every == 0:
@@ -655,13 +833,18 @@ def adapt_me_iis(args) -> None:
         _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), adapt_ckpt)
 
         dataset_field = _dataset_tag(args.dataset_name)
+        method_tag = "me_iis"
+        if args.use_pseudo_labels:
+            method_tag = "me_iis_pl"
+        elif args.gmm_selection_mode == "bic":
+            method_tag = "me_iis_bic"
         _append_csv_safe(
             row={
                 "dataset": dataset_field,
                 "source": args.source_domain,
                 "target": args.target_domain,
                 "seed": args.seed,
-                "method": "me_iis",
+                "method": method_tag,
                 "target_acc": round(adapted_acc, 4),
                 "source_acc": round(acc, 4),
                 "num_latent": total_components,
@@ -715,6 +898,25 @@ def parse_args():
         help="Optional comma-separated overrides 'layer:count,...' for per-layer mixture components.",
     )
     parser.add_argument(
+        "--gmm_selection_mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "bic"],
+        help="How to choose the number of GMM components per layer for ME-IIS.",
+    )
+    parser.add_argument(
+        "--gmm_bic_min_components",
+        type=int,
+        default=2,
+        help="Minimum number of mixture components per layer when using BIC selection.",
+    )
+    parser.add_argument(
+        "--gmm_bic_max_components",
+        type=int,
+        default=8,
+        help="Maximum number of mixture components per layer when using BIC selection.",
+    )
+    parser.add_argument(
         "--feature_layers",
         type=str,
         default="layer3,layer4,avgpool",
@@ -754,6 +956,29 @@ def parse_args():
     )
     parser.add_argument("--classifier_lr", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument(
+        "--use_pseudo_labels",
+        action="store_true",
+        help="If set, include high-confidence pseudo-labelled target samples during ME-IIS adaptation.",
+    )
+    parser.add_argument(
+        "--pseudo_conf_thresh",
+        type=float,
+        default=0.9,
+        help="Confidence threshold for creating pseudo labels on target (max softmax >= this).",
+    )
+    parser.add_argument(
+        "--pseudo_max_ratio",
+        type=float,
+        default=1.0,
+        help="Max size of pseudo-labelled target set as a ratio of the source sample count.",
+    )
+    parser.add_argument(
+        "--pseudo_loss_weight",
+        type=float,
+        default=1.0,
+        help="Multiplicative weight for the pseudo-labelled target loss term.",
+    )
     parser.add_argument("--dry_run_max_samples", type=int, default=0, help="Limit samples for quick dry-runs.")
     parser.add_argument(
         "--dry_run_max_batches",

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from sklearn.mixture import GaussianMixture
 
@@ -53,14 +54,20 @@ class MaxEntAdapter:
         components_per_layer: Dict[str, int],
         device: torch.device = torch.device("cpu"),
         seed: Optional[int] = None,
+        gmm_selection_mode: str = "fixed",
+        gmm_bic_min_components: int = 2,
+        gmm_bic_max_components: int = 8,
     ):
         self.num_classes = num_classes
         self.layers = layers
-        self.components_per_layer = components_per_layer
+        self.components_per_layer = dict(components_per_layer)
         self.device = device
-        self.indexer = ConstraintIndexer(layers, components_per_layer, num_classes)
+        self.indexer = ConstraintIndexer(layers, self.components_per_layer, num_classes)
         self.expected_feature_mass = float(len(layers))
         self.seed = seed
+        self.gmm_selection_mode = gmm_selection_mode
+        self.gmm_bic_min_components = gmm_bic_min_components
+        self.gmm_bic_max_components = gmm_bic_max_components
         self.gmms: Dict[str, GaussianMixture] = self._build_layer_gmms()
 
     def _build_layer_gmms(self) -> Dict[str, GaussianMixture]:
@@ -73,6 +80,68 @@ class MaxEntAdapter:
             )
             for layer in self.layers
         }
+
+    def _refresh_indexer(self) -> None:
+        """Rebuild the constraint indexer after component count changes."""
+        self.indexer = ConstraintIndexer(self.layers, self.components_per_layer, self.num_classes)
+
+    def _select_components_via_bic(
+        self,
+        layer_name: str,
+        feats_np: np.ndarray,
+        min_components: int,
+        max_components: int,
+    ) -> GaussianMixture:
+        """Fit several GMMs and pick the component count with the lowest BIC."""
+        if feats_np.ndim != 2:
+            raise ValueError(f"Expected 2D features for BIC selection, got shape {feats_np.shape}.")
+        n_samples = feats_np.shape[0]
+        if n_samples == 0:
+            raise ValueError("Cannot run BIC selection with zero target samples.")
+        max_subsample = 20000
+        if n_samples > max_subsample:
+            rng = np.random.default_rng(self.seed)
+            idx = rng.choice(n_samples, size=max_subsample, replace=False)
+            feats_np_sub = feats_np[idx]
+        else:
+            feats_np_sub = feats_np
+
+        min_comp = max(1, int(min_components))
+        max_comp = max(min_comp, int(max_components))
+        max_comp = min(max_comp, feats_np_sub.shape[0])
+        min_comp = min(min_comp, max_comp)
+
+        best_bic = np.inf
+        best_m = None
+        for m in range(min_comp, max_comp + 1):
+            if m > feats_np_sub.shape[0]:
+                continue
+            gmm = GaussianMixture(
+                n_components=m,
+                covariance_type="diag",
+                reg_covar=1e-6,
+                random_state=self.seed,
+            )
+            gmm.fit(feats_np_sub)
+            bic = gmm.bic(feats_np_sub)
+            if bic < best_bic:
+                best_bic = bic
+                best_m = m
+
+        if best_m is None:
+            raise RuntimeError(
+                f"BIC component selection failed for layer '{layer_name}' with min={min_components}, max={max_components}."
+            )
+
+        final_gmm = GaussianMixture(
+            n_components=best_m,
+            covariance_type="diag",
+            reg_covar=1e-6,
+            random_state=self.seed,
+        )
+        final_gmm.fit(feats_np)
+        print(f"[GMM] layer={layer_name} selection=bic M*={best_m} BIC={best_bic:.3e}")
+        return final_gmm
 
     def _assert_non_negative(self, tensor: torch.Tensor, name: str, atol: float = 1e-8) -> None:
         min_val = float(tensor.min().item())
@@ -120,9 +189,35 @@ class MaxEntAdapter:
 
     def fit_target_structure(self, target_layer_features: Dict[str, torch.Tensor]) -> None:
         """Fit one GMM per layer on target activations."""
-        for layer, gmm in self.gmms.items():
+        if self.gmm_selection_mode not in {"fixed", "bic"}:
+            raise ValueError(f"Unknown gmm_selection_mode '{self.gmm_selection_mode}'.")
+
+        for layer in self.layers:
             feats_np = target_layer_features[layer].detach().cpu().numpy()
-            gmm.fit(feats_np)
+            if self.gmm_selection_mode == "fixed":
+                gmm = self.gmms.get(layer)
+                if gmm is None or gmm.n_components != self.components_per_layer[layer]:
+                    gmm = GaussianMixture(
+                        n_components=self.components_per_layer[layer],
+                        covariance_type="diag",
+                        reg_covar=1e-6,
+                        random_state=self.seed,
+                    )
+                gmm.fit(feats_np)
+            elif self.gmm_selection_mode == "bic":
+                gmm = self._select_components_via_bic(
+                    layer_name=layer,
+                    feats_np=feats_np,
+                    min_components=self.gmm_bic_min_components,
+                    max_components=self.gmm_bic_max_components,
+                )
+            else:
+                raise ValueError(f"Unknown gmm_selection_mode '{self.gmm_selection_mode}'.")
+
+            self.gmms[layer] = gmm
+            self.components_per_layer[layer] = int(gmm.n_components)
+
+        self._refresh_indexer()
 
     def _predict_gamma(self, layer: str, features: torch.Tensor) -> torch.Tensor:
         feats_np = features.detach().cpu().numpy()

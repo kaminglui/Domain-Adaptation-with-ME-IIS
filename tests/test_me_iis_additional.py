@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
@@ -87,6 +89,98 @@ class TestFeatureMassAggregation(unittest.TestCase):
         self.assertEqual(flat.shape[1], adapter.indexer.total_constraints)
 
 
+class TestGMMBIC(unittest.TestCase):
+    def test_bic_prefers_multiple_components(self) -> None:
+        torch.manual_seed(0)
+        np.random.seed(0)
+        layer = "layer_bic"
+        cluster_a = torch.randn(30, 2) * 0.05 + torch.tensor([0.0, 0.0])
+        cluster_b = torch.randn(30, 2) * 0.05 + torch.tensor([4.0, 4.0])
+        feats = torch.cat([cluster_a, cluster_b], dim=0)
+
+        adapter = MaxEntAdapter(
+            num_classes=2,
+            layers=[layer],
+            components_per_layer={layer: 1},
+            device=torch.device("cpu"),
+            seed=0,
+            gmm_selection_mode="bic",
+            gmm_bic_min_components=1,
+            gmm_bic_max_components=3,
+        )
+        adapter.fit_target_structure({layer: feats})
+        self.assertGreaterEqual(adapter.components_per_layer[layer], 2)
+        gamma = adapter._predict_gamma(layer, feats)
+        assignments = torch.argmax(gamma, dim=1)
+        split = cluster_a.size(0)
+        self.assertNotEqual(torch.mode(assignments[:split]).values.item(), torch.mode(assignments[split:]).values.item())
+
+
+class TestPseudoLabelAdaptation(unittest.TestCase):
+    def test_pseudo_label_smoke(self) -> None:
+        torch.manual_seed(0)
+        device = torch.device("cpu")
+        num_classes = 2
+        model = build_tiny_model(num_classes=num_classes, feature_dim=8).to(device)
+        with torch.no_grad():
+            model.classifier.weight.zero_()
+            model.classifier.bias.data = torch.tensor([2.2, 0.0], device=device)
+
+        # Source data (labels align with pseudo labels to keep gradients consistent).
+        source_images = torch.randn(8, 3, 8, 8)
+        source_labels = torch.zeros(8, dtype=torch.long)
+        source_ds = torch.utils.data.TensorDataset(source_images, source_labels)
+        source_loader = torch.utils.data.DataLoader(
+            adapt_me_iis.IndexedDataset(source_ds), batch_size=2, shuffle=True
+        )
+        weights_vec = torch.ones(len(source_ds)) / float(len(source_ds))
+
+        # Target data with confident predictions for class 0.
+        target_images = torch.randn(6, 3, 8, 8)
+        target_labels_dummy = torch.zeros(len(target_images), dtype=torch.long)
+        target_ds = torch.utils.data.TensorDataset(target_images, target_labels_dummy)
+        target_loader = torch.utils.data.DataLoader(target_ds, batch_size=3, shuffle=False)
+        pseudo_indices, pseudo_labels = adapt_me_iis.build_pseudo_label_dataset(
+            model=model,
+            target_loader=target_loader,
+            device=device,
+            conf_thresh=0.9,
+            max_ratio=1.0,
+            num_source_samples=len(source_ds),
+        )
+        self.assertGreater(len(pseudo_indices), 0)
+        pseudo_ds = adapt_me_iis.PseudoLabeledDataset(target_ds, pseudo_indices, pseudo_labels)
+        pseudo_loader = torch.utils.data.DataLoader(pseudo_ds, batch_size=2, shuffle=True)
+
+        def _compute_pseudo_loss() -> float:
+            total, count = 0.0, 0
+            eval_loader = torch.utils.data.DataLoader(pseudo_ds, batch_size=2, shuffle=False)
+            with torch.no_grad():
+                for imgs, labels in eval_loader:
+                    logits, _ = model(imgs.to(device), return_features=False)
+                    loss = F.cross_entropy(logits, labels.to(device), reduction="sum")
+                    total += float(loss.item())
+                    count += labels.size(0)
+            return total / max(1, count)
+
+        initial_pseudo_loss = _compute_pseudo_loss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        loss, acc, batches, pseudo_used, pseudo_total = adapt_me_iis.adapt_epoch(
+            model=model,
+            optimizer=optimizer,
+            source_loader=source_loader,
+            source_weights_vec=weights_vec,
+            device=device,
+            max_batches=2,
+            pseudo_loader=pseudo_loader,
+            pseudo_loss_weight=1.0,
+        )
+        final_pseudo_loss = _compute_pseudo_loss()
+        self.assertGreater(pseudo_total, 0)
+        self.assertGreaterEqual(pseudo_used, 0)
+        self.assertLess(final_pseudo_loss, initial_pseudo_loss + 1e-4)
+
+
 class TestEndToEndDryRun(unittest.TestCase):
     def test_train_and_adapt_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -133,6 +227,9 @@ class TestEndToEndDryRun(unittest.TestCase):
                 num_workers=0,
                 num_latent_styles=2,
                 components_per_layer=None,
+                gmm_selection_mode="fixed",
+                gmm_bic_min_components=2,
+                gmm_bic_max_components=8,
                 feature_layers="layer3,layer4",
                 source_prob_mode="onehot",
                 iis_iters=3,
@@ -144,6 +241,10 @@ class TestEndToEndDryRun(unittest.TestCase):
                 backbone_lr_scale=0.1,
                 classifier_lr=1e-2,
                 weight_decay=1e-3,
+                use_pseudo_labels=False,
+                pseudo_conf_thresh=0.9,
+                pseudo_max_ratio=1.0,
+                pseudo_loss_weight=1.0,
                 dry_run_max_samples=4,
                 dry_run_max_batches=1,
                 deterministic=True,
