@@ -10,7 +10,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm  # auto picks a CLI-friendly bar if ipywidgets is missing
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -76,6 +76,7 @@ def _normalize_dataset_name(name: str) -> str:
 
 
 def _resolve_officehome_root_from(base: Path) -> Path:
+    """Best-effort to find the Office-Home root inside KaggleHub download folder."""
     if not base.exists() or not base.is_dir():
         return base
     realworld_candidates = ["RealWorld", "Real World", "Real_World", "Real"]
@@ -89,6 +90,7 @@ def _resolve_officehome_root_from(base: Path) -> Path:
 
 
 def _resolve_office31_root_from(base: Path) -> Path:
+    """Best-effort to find the Office-31 root inside KaggleHub download folder."""
     if not base.exists() or not base.is_dir():
         return base
     candidates = [base] + [p for p in base.iterdir() if p.is_dir()]
@@ -99,6 +101,12 @@ def _resolve_office31_root_from(base: Path) -> Path:
 
 
 def _maybe_resolve_data_root(args) -> str:
+    """
+    Pick a dataset root based on user input, environment (Colab vs. local), and defaults.
+    - Respect an existing explicit --data_root.
+    - On Colab, download via KaggleHub.
+    - Otherwise, fall back to repository defaults.
+    """
     if args.data_root:
         explicit = Path(args.data_root)
         if explicit.exists():

@@ -28,6 +28,7 @@ OFFICE31_DOMAIN_TO_SUBDIR: Dict[str, str] = {
 
 
 def _build_transforms(train: bool = True):
+    """Return standard ImageNet-normalized transforms for train/eval."""
     if train:
         return transforms.Compose(
             [
@@ -49,11 +50,13 @@ def _build_transforms(train: bool = True):
 
 
 def _normalize_dataset_name(name: str) -> str:
+    """Normalize dataset aliases such as 'office-home' -> 'officehome'."""
     return name.lower().replace("-", "").replace("_", "").replace(" ", "")
 
 
 # --------------------- Office-Home helpers --------------------- #
 def _oh_normalize_domain_code(domain: str) -> str:
+    """Accept flexible domain strings and map them to canonical Office-Home codes."""
     if domain in OFFICE_HOME_DOMAIN_TO_SUBDIR:
         return domain
     normalized = domain.lower().replace("_", "").replace(" ", "")
@@ -67,6 +70,7 @@ def _oh_normalize_domain_code(domain: str) -> str:
 
 
 def _oh_resolve_realworld_dir(root: Path) -> Path:
+    """Handle RealWorld folder naming variations that appear in the wild."""
     for candidate in OFFICE_HOME_REALWORLD_CANDIDATES:
         candidate_dir = root / candidate
         if candidate_dir.exists():
@@ -77,6 +81,7 @@ def _oh_resolve_realworld_dir(root: Path) -> Path:
 
 
 def _oh_resolve_domain_dir(root: Path, domain: str) -> Path:
+    """Return the concrete domain directory, raising helpful errors on missing paths."""
     code = _oh_normalize_domain_code(domain)
     subdir = OFFICE_HOME_DOMAIN_TO_SUBDIR[code]
     if subdir == "RealWorld":
@@ -88,6 +93,7 @@ def _oh_resolve_domain_dir(root: Path, domain: str) -> Path:
 
 
 def _oh_list_sorted_classes(domain_dir: Path) -> List[str]:
+    """List class subfolders in a deterministic (sorted) order."""
     classes = sorted([p.name for p in domain_dir.iterdir() if p.is_dir()])
     if not classes:
         raise ValueError(f"No class subfolders found in {domain_dir}")
@@ -97,6 +103,7 @@ def _oh_list_sorted_classes(domain_dir: Path) -> List[str]:
 def _oh_build_shared_class_mapping(
     root: Path, source_domain: str, target_domain: str, debug_classes: bool = False
 ) -> Dict[str, int]:
+    """Ensure source/target share identical classes and return a canonical mapping."""
     src_dir = _oh_resolve_domain_dir(root, source_domain)
     tgt_dir = _oh_resolve_domain_dir(root, target_domain)
     src_classes = _oh_list_sorted_classes(src_dir)
@@ -126,6 +133,7 @@ def _oh_get_loaders(
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Build Office-Home source/target loaders with strict class-alignment checks."""
     root_path = Path(root)
     if not root_path.exists():
         raise FileNotFoundError(f"Office-Home root does not exist: {root_path}")
@@ -178,6 +186,7 @@ def _oh_get_loaders(
 
 # --------------------- Office-31 helpers --------------------- #
 def _o31_resolve_domain_dir(root: Path, domain: str) -> Path:
+    """Return the Office-31 domain directory, validating known codes."""
     if domain not in OFFICE31_DOMAIN_TO_SUBDIR:
         raise ValueError(f"Unknown Office-31 domain '{domain}'. Expected one of {list(OFFICE31_DOMAIN_TO_SUBDIR.keys())}.")
     domain_dir = root / OFFICE31_DOMAIN_TO_SUBDIR[domain]
@@ -187,6 +196,7 @@ def _o31_resolve_domain_dir(root: Path, domain: str) -> Path:
 
 
 def _o31_list_sorted_classes(domain_dir: Path) -> List[str]:
+    """List class subfolders in a deterministic (sorted) order."""
     classes = sorted([p.name for p in domain_dir.iterdir() if p.is_dir()])
     if not classes:
         raise ValueError(f"No class subfolders found in {domain_dir}")
@@ -196,6 +206,7 @@ def _o31_list_sorted_classes(domain_dir: Path) -> List[str]:
 def _o31_build_shared_class_mapping(
     root: Path, source_domain: str, target_domain: str, debug_classes: bool = False
 ) -> Dict[str, int]:
+    """Use Amazon (or source) classes as canonical mapping and verify all domains align."""
     canonical_domain = "A" if "A" in {source_domain, target_domain} else source_domain
     canonical_dir = _o31_resolve_domain_dir(root, canonical_domain)
     canonical_classes = _o31_list_sorted_classes(canonical_dir)
@@ -228,6 +239,7 @@ def _o31_get_loaders(
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Build Office-31 source/target loaders with strict class-alignment checks."""
     root_path = Path(root)
     if not root_path.exists():
         raise FileNotFoundError(f"Office-31 root does not exist: {root_path}")
@@ -285,6 +297,7 @@ def get_domain_loaders(
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Public entrypoint to build aligned source/target loaders for supported datasets."""
     name = _normalize_dataset_name(dataset_name)
 
     if name in ("officehome",):
