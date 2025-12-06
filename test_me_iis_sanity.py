@@ -1,10 +1,13 @@
+import unittest
+from typing import Tuple
+
 import numpy as np
 import torch
 
 from models.me_iis_adapter import MaxEntAdapter
 
 
-def build_toy_joint(num_samples: int, frac_group_a: float, layers) -> torch.Tensor:
+def build_toy_joint(num_samples: int, frac_group_a: float, layers):
     """Construct deterministic joint features for (layer, component, class)."""
     num_group_a = int(num_samples * frac_group_a)
     num_group_b = num_samples - num_group_a
@@ -21,57 +24,74 @@ def build_toy_joint(num_samples: int, frac_group_a: float, layers) -> torch.Tens
     return joint, class_probs
 
 
-def run_sanity() -> None:
-    torch.manual_seed(0)
-    np.random.seed(0)
-    device = torch.device("cpu")
-    N_SRC = 200
-    N_TGT = 200
-    layers = ["layer0", "layer1"]
-    components_per_layer = {layer: 2 for layer in layers}
-    adapter = MaxEntAdapter(num_classes=2, layers=layers, components_per_layer=components_per_layer, device=device)
+def entropy(weights: torch.Tensor) -> float:
+    w = torch.clamp(weights, min=1e-12)
+    return float(-(w * torch.log(w)).sum().item())
 
-    source_joint, source_class_probs = build_toy_joint(N_SRC, frac_group_a=0.5, layers=layers)
-    target_joint, target_class_probs = build_toy_joint(N_TGT, frac_group_a=0.75, layers=layers)
 
-    source_flat = adapter.indexer.flatten(source_joint).to(device)
-    target_moments = adapter.indexer.flatten(target_joint).to(device).mean(dim=0)
+class TestIISSanity(unittest.TestCase):
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        np.random.seed(0)
+        self.device = torch.device("cpu")
+        self.layers = ["layer0", "layer1"]
+        self.components_per_layer = {layer: 2 for layer in self.layers}
+        self.adapter = MaxEntAdapter(
+            num_classes=2, layers=self.layers, components_per_layer=self.components_per_layer, device=self.device
+        )
 
-    init_weights = torch.ones(N_SRC, device=device) / float(N_SRC)
-    init_moments = torch.sum(init_weights.view(-1, 1) * source_flat, dim=0)
-    init_error = float((init_moments - target_moments).abs().max().item())
+    def _initial_error(self, source_flat: torch.Tensor, target_moments: torch.Tensor) -> Tuple[float, torch.Tensor]:
+        init_weights = torch.ones(source_flat.size(0), device=self.device) / float(source_flat.size(0))
+        init_moments = torch.sum(init_weights.view(-1, 1) * source_flat, dim=0)
+        init_error = float((init_moments - target_moments).abs().max().item())
+        return init_error, init_weights
 
-    weights, _ = adapter.solve_iis(
-        source_layer_feats={},
-        source_class_probs=source_class_probs.to(device),
-        target_layer_feats={},
-        target_class_probs=target_class_probs.to(device),
-        precomputed_source_joint=source_joint,
-        precomputed_target_joint=target_joint,
-        max_iter=20,
-        iis_tol=0.0,
-    )
-    final_moments = torch.sum(weights.view(-1, 1) * source_flat, dim=0)
-    final_error = float((final_moments - target_moments).abs().max().item())
+    def test_precomputed_joint_matches_moments(self) -> None:
+        source_joint, _ = build_toy_joint(200, frac_group_a=0.5, layers=self.layers)
+        target_joint, _ = build_toy_joint(200, frac_group_a=0.75, layers=self.layers)
 
-    print("Synthetic ME-IIS sanity test:")
-    print(f"  initial max_abs_error = {init_error:.6f}")
-    print(f"  final   max_abs_error = {final_error:.6f}")
-    if final_error < 0.1 * init_error:
-        print("PASS: final error < 0.1 * initial error")
-    else:
-        print("FAIL: final error >= 0.1 * initial error")
+        source_flat = self.adapter.indexer.flatten(source_joint).to(self.device)
+        target_moments = self.adapter.indexer.flatten(target_joint).to(self.device).mean(dim=0)
+        init_error, init_weights = self._initial_error(source_flat, target_moments)
+        init_entropy = entropy(init_weights)
+
+        weights, final_error, history = self.adapter.solve_iis_from_joint(
+            source_joint=source_joint,
+            target_joint=target_joint,
+            max_iter=30,
+            iis_tol=0.0,
+        )
+        self.assertGreater(len(history), 0)
+        self.assertAlmostEqual(weights.sum().item(), 1.0, places=6)
+        self.assertGreaterEqual(float(weights.min().item()), 0.0)
+        self.assertLess(final_error, init_error)
+        self.assertTrue(final_error < 0.05 or final_error < 0.1 * init_error)
+        final_entropy = entropy(weights)
+        self.assertGreater(final_entropy, 0.2 * init_entropy)
+
+    def test_uniform_when_moments_agree(self) -> None:
+        source_joint, _ = build_toy_joint(64, frac_group_a=0.6, layers=self.layers)
+        target_joint, _ = build_toy_joint(64, frac_group_a=0.6, layers=self.layers)
+
+        source_flat = self.adapter.indexer.flatten(source_joint).to(self.device)
+        target_moments = self.adapter.indexer.flatten(target_joint).to(self.device).mean(dim=0)
+        init_error, _ = self._initial_error(source_flat, target_moments)
+
+        weights, final_error, history = self.adapter.solve_iis_from_joint(
+            source_joint=source_joint,
+            target_joint=target_joint,
+            max_iter=20,
+            iis_tol=0.0,
+        )
+        self.assertGreater(len(history), 0)
+        self.assertLess(final_error, max(1e-4, 0.5 * init_error))
+        uniform = torch.ones_like(weights) / float(weights.numel())
+        deviation = torch.max((weights - uniform).abs()).item()
+        self.assertLess(deviation, 0.05 * uniform[0].item())
+        entropy_uniform = entropy(uniform)
+        entropy_final = entropy(weights)
+        self.assertGreater(entropy_final, 0.9 * entropy_uniform)
 
 
 if __name__ == "__main__":
-    run_sanity()
-
-# Quick sanity tests (no dataset needed):
-#
-#   python test_me_iis_sanity.py
-#
-# If Office-Home is available at D:\datasets\OfficeHome (for example):
-#
-#   python train_source.py --data_root D:\datasets\OfficeHome --source_domain Ar --target_domain Cl --num_epochs 1 --batch_size 8 --dry_run_max_batches 5
-#
-#   python adapt_me_iis.py  --data_root D:\datasets\OfficeHome --source_domain Ar --target_domain Cl --checkpoint checkpoints/source_only_Ar_to_Cl_seed0.pth --dry_run_max_batches 5
+    unittest.main()

@@ -58,12 +58,57 @@ class MaxEntAdapter:
         self.components_per_layer = components_per_layer
         self.device = device
         self.indexer = ConstraintIndexer(layers, components_per_layer, num_classes)
+        self.expected_feature_mass = float(len(layers))
         self.gmms: Dict[str, GaussianMixture] = {
             layer: GaussianMixture(
                 n_components=components_per_layer[layer], covariance_type="diag", reg_covar=1e-6
             )
             for layer in layers
         }
+
+    def _assert_non_negative(self, tensor: torch.Tensor, name: str, atol: float = 1e-8) -> None:
+        min_val = float(tensor.min().item())
+        if min_val < -atol:
+            raise ValueError(f"{name} contains negative entries (min={min_val:.3e}). Constraints must be non-negative.")
+
+    def _assert_valid_distribution(self, weights: torch.Tensor, name: str = "weights", atol: float = 1e-6) -> None:
+        if torch.isnan(weights).any():
+            raise RuntimeError(f"{name} contains NaNs.")
+        min_val = float(weights.min().detach().cpu().item())
+        sum_val = float(weights.sum().detach().cpu().item())
+        if min_val < -atol:
+            raise RuntimeError(f"{name} has negative entries (min={min_val:.3e}).")
+        if abs(sum_val - 1.0) > atol:
+            raise RuntimeError(f"{name} must sum to 1 within atol={atol}. Got sum={sum_val:.6f}.")
+
+    def _validate_joint_features(
+        self,
+        joint: Dict[str, torch.Tensor],
+        name: str,
+        rel_mass_tol: float,
+        expected_mass: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        expected = self.expected_feature_mass if expected_mass is None else float(expected_mass)
+        for layer in self.layers:
+            if layer not in joint:
+                raise ValueError(f"{name} missing layer '{layer}'.")
+            tensor = joint[layer]
+            if tensor.dim() != 3 or tensor.shape[2] != self.num_classes:
+                raise ValueError(
+                    f"{name}[{layer}] must have shape (N, J_l, K) with K={self.num_classes}. Got {tuple(tensor.shape)}."
+                )
+            self._assert_non_negative(tensor, f"{name}[{layer}]")
+        flat = self.indexer.flatten(joint).to(self.device)
+        feature_mass = flat.sum(dim=1)
+        eps = 1e-8
+        max_dev = float((feature_mass - expected).abs().max().item())
+        rel_dev = max_dev / (abs(expected) + eps)
+        if rel_dev > rel_mass_tol:
+            raise ValueError(
+                f"{name} feature mass deviates from expected ~{expected:.6f} "
+                f"(max_abs_dev={max_dev:.4e}, rel_dev={rel_dev:.3e}, tol={rel_mass_tol:.3e})."
+            )
+        return flat, feature_mass
 
     def fit_target_structure(self, target_layer_features: Dict[str, torch.Tensor]) -> None:
         """Fit one GMM per layer on target activations."""
@@ -94,10 +139,10 @@ class MaxEntAdapter:
 
     def solve_iis(
         self,
-        source_layer_feats: Dict[str, torch.Tensor],
-        source_class_probs: torch.Tensor,
-        target_layer_feats: Dict[str, torch.Tensor],
-        target_class_probs: torch.Tensor,
+        source_layer_feats: Optional[Dict[str, torch.Tensor]],
+        source_class_probs: Optional[torch.Tensor],
+        target_layer_feats: Optional[Dict[str, torch.Tensor]],
+        target_class_probs: Optional[torch.Tensor],
         max_iter: int = 15,
         iis_tol: float = 0.0,
         f_mass_rel_tol: float = 1e-2,
@@ -123,21 +168,29 @@ class MaxEntAdapter:
         if precomputed_target_joint is not None:
             target_joint = precomputed_target_joint
         else:
+            if target_layer_feats is None or target_class_probs is None:
+                raise ValueError("target_layer_feats and target_class_probs are required when no precomputed target joint is provided.")
             target_joint = self.get_joint_features(target_layer_feats, target_class_probs)
-        target_flat = self.indexer.flatten(target_joint)  # (N_t, C)
+        target_flat, _ = self._validate_joint_features(
+            target_joint, name="target_joint", rel_mass_tol=f_mass_rel_tol
+        )
         target_moments = target_flat.to(device).mean(dim=0)  # (C,)
 
         # Build source joint features (fractional features summed across layers)
         if precomputed_source_joint is not None:
             source_joint = precomputed_source_joint
         else:
+            if source_layer_feats is None or source_class_probs is None:
+                raise ValueError("source_layer_feats and source_class_probs are required when no precomputed source joint is provided.")
             source_joint = self.get_joint_features(source_layer_feats, source_class_probs)
-        source_flat = self.indexer.flatten(source_joint).to(device)  # (N_s, C)
+        source_flat, feature_mass = self._validate_joint_features(
+            source_joint, name="source_joint", rel_mass_tol=f_mass_rel_tol
+        )
+        source_flat = source_flat.to(device)  # (N_s, C)
 
         N_s = source_flat.size(0)
         weights = torch.ones(N_s, device=device) / float(N_s)
         lambdas = torch.zeros(self.indexer.total_constraints, device=device)
-        feature_mass = source_flat.sum(dim=1)  # should be constant (#layers) for our construction
         f_mass_mean = float(feature_mass.mean().item())
         f_mass_std = float(feature_mass.std().item())
         mass_constant = f_mass_mean
@@ -158,6 +211,7 @@ class MaxEntAdapter:
             )
 
         history: List[IISIterationStats] = []
+        converged = False
         for it in range(max_iter):
             current_moments = torch.sum(weights.view(-1, 1) * source_flat, dim=0)  # (C,)
             ratio = torch.ones_like(current_moments)
@@ -177,8 +231,7 @@ class MaxEntAdapter:
             if weight_sum.item() <= eps:
                 raise RuntimeError("Weights collapsed to zero mass during IIS update.")
             weights = weights / weight_sum
-            if torch.any(weights < 0) or abs(weights.sum().item() - 1.0) > 1e-6:
-                raise RuntimeError("Weights after IIS update are not a valid probability distribution.")
+            self._assert_valid_distribution(weights, name="IIS weights")
 
             updated_moments = torch.sum(weights.view(-1, 1) * source_flat, dim=0)
             moment_error = updated_moments - target_moments
@@ -210,6 +263,7 @@ class MaxEntAdapter:
             )
             if iis_tol > 0 and max_abs_error < iis_tol:
                 print(f"[IIS] Converged at iter {it+1} with max_abs_error {max_abs_error:.4e} < tol {iis_tol:.4e}")
+                converged = True
                 break
         if history:
             last = history[-1]
@@ -217,4 +271,40 @@ class MaxEntAdapter:
                 f"IIS finished: iters={len(history)}, max_abs_error={last.max_moment_error:.4e}, "
                 f"l2_error={last.l2_moment_error:.4e}, entropy={last.weight_entropy:.4f}"
             )
+        if iis_tol > 0 and converged and history and history[-1].max_moment_error > iis_tol:
+            raise RuntimeError(
+                f"IIS termination did not satisfy tolerance iis_tol={iis_tol:.3e} "
+                f"(final max_abs_error={history[-1].max_moment_error:.4e})."
+            )
+        if iis_tol > 0 and not converged:
+            print(
+                f"[IIS][WARN] Did not meet tolerance iis_tol={iis_tol:.3e} within {max_iter} iterations. "
+                f"Final max_abs_error={history[-1].max_moment_error if history else float('nan'):.4e}."
+            )
+        self._assert_valid_distribution(weights, name="IIS final weights")
+        self._assert_non_negative(target_moments, "target moments")
+        self._assert_non_negative(source_flat, "source joint features")
         return weights.detach(), history
+
+    def solve_iis_from_joint(
+        self,
+        source_joint: Dict[str, torch.Tensor],
+        target_joint: Dict[str, torch.Tensor],
+        max_iter: int = 15,
+        iis_tol: float = 0.0,
+        f_mass_rel_tol: float = 1e-2,
+    ) -> Tuple[torch.Tensor, float, List[IISIterationStats]]:
+        """Run IIS directly on precomputed joint constraint features."""
+        weights, history = self.solve_iis(
+            source_layer_feats=None,
+            source_class_probs=None,
+            target_layer_feats=None,
+            target_class_probs=None,
+            max_iter=max_iter,
+            iis_tol=iis_tol,
+            f_mass_rel_tol=f_mass_rel_tol,
+            precomputed_source_joint=source_joint,
+            precomputed_target_joint=target_joint,
+        )
+        final_error = history[-1].max_moment_error if history else float("nan")
+        return weights, final_error, history
