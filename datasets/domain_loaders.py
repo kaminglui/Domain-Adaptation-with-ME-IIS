@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
+import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
@@ -132,6 +133,8 @@ def _oh_get_loaders(
     num_workers: int = 4,
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+    worker_init_fn: Optional[Callable[[int], None]] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Build Office-Home source/target loaders with strict class-alignment checks."""
     root_path = Path(root)
@@ -176,10 +179,32 @@ def _oh_get_loaders(
     target_ds = maybe_subset(target_ds)
     target_eval_ds = maybe_subset(target_eval_ds)
 
-    source_loader = DataLoader(source_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False)
-    target_loader = DataLoader(target_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False)
+    source_loader = DataLoader(
+        source_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=False,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
+    )
+    target_loader = DataLoader(
+        target_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=False,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
+    )
     target_eval_loader = DataLoader(
-        target_eval_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
+        target_eval_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
     return source_loader, target_loader, target_eval_loader
 
@@ -238,6 +263,8 @@ def _o31_get_loaders(
     num_workers: int = 4,
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+    worker_init_fn: Optional[Callable[[int], None]] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Build Office-31 source/target loaders with strict class-alignment checks."""
     root_path = Path(root)
@@ -281,9 +308,30 @@ def _o31_get_loaders(
     target_ds = maybe_subset(target_ds)
     target_eval_ds = maybe_subset(target_eval_ds)
 
-    source_loader = DataLoader(source_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    target_loader = DataLoader(target_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    target_eval_loader = DataLoader(target_eval_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    source_loader = DataLoader(
+        source_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
+    )
+    target_loader = DataLoader(
+        target_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
+    )
+    target_eval_loader = DataLoader(
+        target_eval_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
+    )
     return source_loader, target_loader, target_eval_loader
 
 
@@ -296,6 +344,8 @@ def get_domain_loaders(
     num_workers: int = 4,
     debug_classes: bool = False,
     max_samples_per_domain: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
+    worker_init_fn: Optional[Callable[[int], None]] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Public entrypoint to build aligned source/target loaders for supported datasets."""
     name = _normalize_dataset_name(dataset_name)
@@ -311,6 +361,8 @@ def get_domain_loaders(
             num_workers=num_workers,
             debug_classes=debug_classes,
             max_samples_per_domain=max_samples_per_domain,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
         )
     elif name in ("office31",):
         if root is None:
@@ -323,6 +375,8 @@ def get_domain_loaders(
             num_workers=num_workers,
             debug_classes=debug_classes,
             max_samples_per_domain=max_samples_per_domain,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
         )
     else:
         raise ValueError(f"Unknown dataset_name '{dataset_name}'. Expected 'office_home' or 'office31'.")

@@ -22,8 +22,9 @@ from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_R
 from eval import evaluate
 from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
-from utils.data_utils import build_loader, make_generator
+from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
+from utils.feature_utils import extract_features
 from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
 from torchvision import datasets
@@ -315,43 +316,6 @@ def build_pseudo_label_dataset(
     return pseudo_indices, pseudo_labels
 
 
-@torch.no_grad()
-def extract_layer_features(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    feature_layers: Tuple[str, ...],
-    max_batches: int = 0,
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Extract logits and pooled activations for the requested layers."""
-    model.eval()
-    feats: Dict[str, List[torch.Tensor]] = {layer: [] for layer in feature_layers}
-    logits_list: List[torch.Tensor] = []
-    labels: List[torch.Tensor] = []
-    batch_count = 0
-    for batch in tqdm(loader, desc="Extract", leave=False):
-        if len(batch) == 2:
-            images, batch_labels = batch
-        else:
-            images, batch_labels = batch[0], batch[1]
-        images = images.to(device)
-        logits, _, inter = model.forward_with_intermediates(images, feature_layers=feature_layers)
-        logits_list.append(logits.cpu())
-        labels.append(batch_labels)
-        for layer in feature_layers:
-            feats[layer].append(inter[layer].cpu())
-        batch_count += 1
-        if max_batches > 0 and batch_count >= max_batches:
-            break
-
-    if not logits_list:
-        raise RuntimeError("No batches were processed during feature extraction.")
-    layer_feats = {layer: torch.cat(feats[layer]) for layer in feature_layers}
-    logits_all = torch.cat(logits_list)
-    labels_all = torch.cat(labels)
-    return layer_feats, logits_all, labels_all
-
-
 def adapt_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -476,6 +440,7 @@ def adapt_me_iis(args) -> None:
     set_seed(args.seed, deterministic=args.deterministic)
     device = get_device(deterministic=args.deterministic)
     data_generator = make_generator(args.seed)
+    worker_init = make_worker_init_fn(args.seed)
     feature_layers = _parse_feature_layers(args.feature_layers)
     components_map = _build_component_map(feature_layers, args.components_per_layer, args.num_latent_styles)
     components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
@@ -509,6 +474,8 @@ def adapt_me_iis(args) -> None:
         num_workers=args.num_workers,
         debug_classes=False,
         max_samples_per_domain=args.dry_run_max_samples if args.dry_run_max_samples > 0 else None,
+        generator=data_generator,
+        worker_init_fn=worker_init,
     )
 
     source_train_raw = source_loader.dataset
@@ -587,14 +554,14 @@ def adapt_me_iis(args) -> None:
     )
 
     with torch.no_grad():
-        source_feats, source_logits, source_labels = extract_layer_features(
+        source_feats, source_logits, source_labels = extract_features(
             model,
             source_feat_loader,
             device,
             feature_layers,
             max_batches=args.dry_run_max_batches,
         )
-        target_feats, target_logits, target_labels = extract_layer_features(
+        target_feats, target_logits, target_labels = extract_features(
             model,
             target_feat_loader,
             device,
@@ -986,7 +953,11 @@ def parse_args():
         default=0,
         help="If >0, limit both feature extraction and adaptation training to this many batches per phase.",
     )
-    parser.add_argument("--deterministic", action="store_true", help="Force deterministic/cuDNN safe settings.")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic/cuDNN safe settings (pair with --seed for reproducibility).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 

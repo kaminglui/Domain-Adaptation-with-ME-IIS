@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -43,9 +44,37 @@ class ConstraintIndexer:
             flats.append(joint[layer].reshape(joint[layer].shape[0], -1))
         return torch.cat(flats, dim=1)
 
+    def decode(self, flat_idx: int) -> Tuple[str, int, int]:
+        """
+        Map a flattened constraint index back to (layer, component_idx, class_idx).
+        """
+        if flat_idx < 0 or flat_idx >= self.total_constraints:
+            raise ValueError(f"Flat index {flat_idx} out of range [0, {self.total_constraints}).")
+        for layer in self.layers:
+            start = self.offsets[layer]
+            width = self.components_per_layer[layer] * self.num_classes
+            end = start + width
+            if start <= flat_idx < end:
+                local = flat_idx - start
+                comp_idx = local // self.num_classes
+                class_idx = local % self.num_classes
+                return layer, int(comp_idx), int(class_idx)
+        raise RuntimeError(f"Failed to decode flat index {flat_idx}.")
+
 
 class MaxEntAdapter:
-    """Maximum Entropy IIS adapter with multi-layer fractional features (Pal & Miller style)."""
+    """
+    Maximum Entropy IIS adapter using the Pal & Miller fractional IIS extension.
+
+    We build *fractional* feature counts by multiplying GMM responsibilities with
+    class posteriors on target features, yielding probabilistic instances per
+    (mixture-component, class) constraint. Improved Iterative Scaling then finds
+    a maximum entropy distribution over source samples whose expected fractional
+    feature moments match those of the target. The update below is the
+    Pal-Miller-style extension of IIS to probabilistic feature instances
+    (Pal & Miller (2007), "An Extension of Iterative Scaling for Decision and
+    Data Aggregation in Ensemble Classification").
+    """
 
     def __init__(
         self,
@@ -69,6 +98,7 @@ class MaxEntAdapter:
         self.gmm_bic_min_components = gmm_bic_min_components
         self.gmm_bic_max_components = gmm_bic_max_components
         self.gmms: Dict[str, GaussianMixture] = self._build_layer_gmms()
+        self.unachievable_constraints: List[int] = []
 
     def _build_layer_gmms(self) -> Dict[str, GaussianMixture]:
         return {
@@ -187,6 +217,10 @@ class MaxEntAdapter:
             )
         return flat, feature_mass
 
+    def decode_constraint(self, flat_idx: int) -> Tuple[str, int, int]:
+        """Expose index decoding for logging and tests."""
+        return self.indexer.decode(flat_idx)
+
     def fit_target_structure(self, target_layer_features: Dict[str, torch.Tensor]) -> None:
         """Fit one GMM per layer on target activations."""
         if self.gmm_selection_mode not in {"fixed", "bic"}:
@@ -231,6 +265,7 @@ class MaxEntAdapter:
         joint: Dict[str, torch.Tensor] = {}
         for layer in self.layers:
             gamma = self._predict_gamma(layer, layer_features[layer])  # (N, J_l)
+            # Each entry is a fractional feature count P(component=j, class=k | x) as in Pal & Miller's probabilistic instances.
             joint[layer] = gamma.unsqueeze(2) * class_probs.unsqueeze(1)
         return joint
 
@@ -251,6 +286,7 @@ class MaxEntAdapter:
         f_mass_rel_tol: float = 1e-2,
         precomputed_source_joint: Optional[Dict[str, torch.Tensor]] = None,
         precomputed_target_joint: Optional[Dict[str, torch.Tensor]] = None,
+        verbose: bool = False,
     ) -> Tuple[torch.Tensor, List[IISIterationStats]]:
         """
         Solve for Q(x) over source samples using Pal & Miller fractional IIS.
@@ -265,6 +301,7 @@ class MaxEntAdapter:
             f_mass_rel_tol: relative std threshold to warn on feature-mass non-constancy.
             precomputed_source_joint: optional joint feature tensor dict for synthetic tests.
             precomputed_target_joint: optional joint feature tensor dict for synthetic tests.
+            verbose: if True, log per-iteration weight statistics for debugging.
         """
         device = self.device
         # Compute target constraint moments
@@ -290,6 +327,20 @@ class MaxEntAdapter:
             source_joint, name="source_joint", rel_mass_tol=f_mass_rel_tol
         )
         source_flat = source_flat.to(device)  # (N_s, C)
+        source_sum = source_flat.sum(dim=0)
+        unreachable_mask = (source_sum == 0) & (target_moments > 0)
+        self.unachievable_constraints = []
+        if bool(unreachable_mask.any()):
+            unreachable_indices = torch.nonzero(unreachable_mask, as_tuple=False).view(-1).tolist()
+            for flat_idx in unreachable_indices:
+                layer, comp_idx, class_idx = self.decode_constraint(int(flat_idx))
+                target_prob = float(target_moments[flat_idx].detach().cpu().item())
+                print(
+                    "[IIS][WARNING] Unachievable constraint: "
+                    f"no source sample has feature {layer}[component={comp_idx}, class={class_idx}], "
+                    f"target probability={target_prob:.6f}"
+                )
+                self.unachievable_constraints.append(int(flat_idx))
 
         N_s = source_flat.size(0)
         weights = torch.ones(N_s, device=device) / float(N_s)
@@ -322,6 +373,7 @@ class MaxEntAdapter:
             ratio[active_mask] = (target_moments[active_mask] + eps) / (current_moments[active_mask] + eps)
             ratio = torch.clamp(ratio, min=1e-6, max=1e6)
             delta_update = torch.zeros_like(current_moments)
+            # Pal & Miller Eq. (12): Δλ = (1 / Nd) · log(P_g / P_m), with mass_constant acting as Nd for fractional features.
             delta_update[active_mask] = torch.log(ratio[active_mask]) / (mass_constant + eps)
             lambdas = lambdas + delta_update
 
@@ -360,6 +412,13 @@ class MaxEntAdapter:
                 feature_mass_std=f_mass_std,
             )
             history.append(hist)
+            if verbose:
+                weight_mean = float(w_cpu.mean().item())
+                print(
+                    f"[IIS][DEBUG] Weight stats - min: {hist.weight_min:.6f}, "
+                    f"max: {hist.weight_max:.6f}, mean: {weight_mean:.6f}"
+                )
+                sys.stdout.flush()
             print(
                 f"[IIS] iter {it+1}/{max_iter} | ||delta|| {delta_norm:.4f} | "
                 f"KL {kl:.4e} | max mom err {hist.max_moment_error:.4e} | "
@@ -388,6 +447,24 @@ class MaxEntAdapter:
         self._assert_valid_distribution(weights, name="IIS final weights")
         self._assert_non_negative(target_moments, "target moments")
         self._assert_non_negative(source_flat, "source joint features")
+        if (
+            source_class_probs is not None
+            and target_class_probs is not None
+            and precomputed_source_joint is None
+            and precomputed_target_joint is None
+        ):
+            p_target = target_class_probs.detach().mean(dim=0)
+            p_source = source_class_probs.detach().mean(dim=0)
+            p_weighted = torch.sum(weights.view(-1, 1) * source_class_probs.detach(), dim=0)
+            print("[IIS] Class marginals comparison:")
+            for cls_idx in range(self.num_classes):
+                print(
+                    f"  Class {cls_idx}: "
+                    f"P_target={float(p_target[cls_idx]):.6f}, "
+                    f"P_weighted_source={float(p_weighted[cls_idx]):.6f}, "
+                    f"P_source={float(p_source[cls_idx]):.6f}"
+                )
+            sys.stdout.flush()
         return weights.detach(), history
 
     def solve_iis_from_joint(
@@ -397,6 +474,7 @@ class MaxEntAdapter:
         max_iter: int = 15,
         iis_tol: float = 0.0,
         f_mass_rel_tol: float = 1e-2,
+        verbose: bool = False,
     ) -> Tuple[torch.Tensor, float, List[IISIterationStats]]:
         """Run IIS directly on precomputed joint constraint features."""
         weights, history = self.solve_iis(
@@ -409,6 +487,7 @@ class MaxEntAdapter:
             f_mass_rel_tol=f_mass_rel_tol,
             precomputed_source_joint=source_joint,
             precomputed_target_joint=target_joint,
+            verbose=verbose,
         )
         final_error = history[-1].max_moment_error if history else float("nan")
         return weights, final_error, history

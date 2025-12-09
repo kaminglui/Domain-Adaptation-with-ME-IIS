@@ -1,7 +1,10 @@
 import argparse
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Dict
 from unittest import mock
 
 import numpy as np
@@ -15,11 +18,20 @@ from models.me_iis_adapter import MaxEntAdapter
 from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
 
 
+def _one_layer_joint_from_components(components: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """
+    Helper to wrap a (N, J) component matrix into a single-layer joint dict with K=1.
+    """
+    if components.dim() != 2:
+        raise ValueError(f"components must be 2D (N, J), got shape {tuple(components.shape)}")
+    return {"layer": components.unsqueeze(2).clone()}
+
+
 class TestIISKnownSolution(unittest.TestCase):
-    def test_two_point_known_solution(self) -> None:
+    def test_exact_solution_known_joint(self) -> None:
         """
         When each sample uniquely activates one constraint, IIS should recover
-        the target component proportions in a single step.
+        the target proportions (e.g., 4:1 => 0.8/0.2).
         """
         device = torch.device("cpu")
         adapter = MaxEntAdapter(
@@ -51,6 +63,92 @@ class TestIISKnownSolution(unittest.TestCase):
         self.assertTrue(final_error < 1e-4)
         expected = torch.tensor([0.8, 0.2])
         self.assertTrue(torch.allclose(weights.cpu(), expected, atol=1e-3))
+
+
+class TestIISConvergenceProperties(unittest.TestCase):
+    def setUp(self) -> None:
+        self.device = torch.device("cpu")
+        self.layer = "layer"
+        self.adapter = MaxEntAdapter(
+            num_classes=1, layers=[self.layer], components_per_layer={self.layer: 2}, device=self.device
+        )
+
+    def test_monotonic_moment_error(self) -> None:
+        source_components = torch.tensor(
+            [[0.7, 0.3], [0.4, 0.6], [0.2, 0.8]], dtype=torch.float32, device=self.device
+        )
+        target_components = torch.tensor(
+            [[0.8, 0.2], [0.5, 0.5], [0.1, 0.9]], dtype=torch.float32, device=self.device
+        )
+        weights, final_error, history = self.adapter.solve_iis_from_joint(
+            source_joint=_one_layer_joint_from_components(source_components.cpu()),
+            target_joint=_one_layer_joint_from_components(target_components.cpu()),
+            max_iter=6,
+            iis_tol=0.0,
+        )
+        self.assertGreater(len(history), 1)
+        errors = [h.max_moment_error for h in history]
+        for prev, curr in zip(errors, errors[1:]):
+            self.assertLessEqual(curr, prev + 1e-6)
+        self.assertGreaterEqual(final_error, 0.0)
+
+    def test_group_weight_shift_ratio(self) -> None:
+        source_components = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32
+        )
+        target_components = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+        weights, final_error, history = self.adapter.solve_iis_from_joint(
+            source_joint=_one_layer_joint_from_components(source_components),
+            target_joint=_one_layer_joint_from_components(target_components),
+            max_iter=10,
+            iis_tol=0.0,
+        )
+        group_a_mass = float(weights[:3].sum().item())
+        group_b_mass = float(weights[3:].sum().item())
+        self.assertAlmostEqual(group_a_mass + group_b_mass, 1.0, places=6)
+        ratio = group_a_mass / group_b_mass
+        self.assertAlmostEqual(ratio, 1.0, places=3)
+        self.assertLess(history[-1].max_moment_error, 1e-3)
+
+    def test_unreachable_constraint(self) -> None:
+        source_components = torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+        target_components = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            weights, final_error, history = self.adapter.solve_iis_from_joint(
+                source_joint=_one_layer_joint_from_components(source_components),
+                target_joint=_one_layer_joint_from_components(target_components),
+                max_iter=4,
+                iis_tol=0.0,
+            )
+        output = buf.getvalue()
+        self.assertIn("Unachievable constraint", output)
+        self.assertIn("component=1, class=0", output)
+        self.assertTrue(self.adapter.unachievable_constraints)
+        layer, comp_idx, class_idx = self.adapter.decode_constraint(self.adapter.unachievable_constraints[0])
+        self.assertEqual(layer, self.layer)
+        self.assertEqual(comp_idx, 1)
+        self.assertEqual(class_idx, 0)
+        self.assertGreater(history[-1].max_moment_error, 1e-3)
+        self.assertAlmostEqual(float(weights.sum().item()), 1.0, places=6)
+
+    def test_converges_to_uniform_when_source_equals_target(self) -> None:
+        source_components = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32
+        )
+        target_components = source_components.clone()
+        weights, final_error, history = self.adapter.solve_iis_from_joint(
+            source_joint=_one_layer_joint_from_components(source_components),
+            target_joint=_one_layer_joint_from_components(target_components),
+            max_iter=5,
+            iis_tol=0.0,
+        )
+        uniform = torch.full_like(weights, 1.0 / weights.numel())
+        self.assertTrue(torch.allclose(weights, uniform, atol=5e-3))
+        self.assertLess(final_error, 1e-6)
+        entropy_uniform = float(-(uniform * torch.log(uniform)).sum().item())
+        entropy_final = float(-(weights * torch.log(weights + 1e-12)).sum().item())
+        self.assertGreater(entropy_final, 0.95 * entropy_uniform)
 
 
 class TestClassMappingAlignment(unittest.TestCase):

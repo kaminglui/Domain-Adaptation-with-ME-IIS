@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_ROOT, get_domain_loaders
 from eval import evaluate
 from models.classifier import build_model
-from utils.data_utils import build_loader, make_generator
+from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
@@ -195,6 +195,7 @@ def train_source(args) -> None:
     set_seed(args.seed, deterministic=args.deterministic)
     device = get_device(deterministic=args.deterministic)
     data_generator = make_generator(args.seed)
+    worker_init = make_worker_init_fn(args.seed)
     source_loader, _, target_eval_loader = get_domain_loaders(
         dataset_name=args.dataset_name,
         source_domain=args.source_domain,
@@ -204,6 +205,8 @@ def train_source(args) -> None:
         num_workers=args.num_workers,
         debug_classes=False,
         max_samples_per_domain=args.dry_run_max_samples if args.dry_run_max_samples > 0 else None,
+        generator=data_generator,
+        worker_init_fn=worker_init,
     )
     source_ds = source_loader.dataset
     target_eval_ds = target_eval_loader.dataset
@@ -438,7 +441,11 @@ def parse_args():
     parser.add_argument("--lr_classifier", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--deterministic", action="store_true", help="Force deterministic/cuDNN safe settings.")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic/cuDNN safe settings (pair with --seed for reproducibility).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--dry_run_max_batches",
