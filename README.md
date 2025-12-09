@@ -7,7 +7,7 @@ Minimal max-entropy importance sampling (ME-IIS) domain adaptation for Office-Ho
 - Keep Colab's preinstalled CUDA PyTorch; install the remaining deps below and use `--num_workers 2` by default.
 
 ```bash
-!git clone https://github.com/<your-username>/ME-IIS.git
+!git clone https://github.com/kaminglui/Domain-Adaptation-with-ME-IIS.git
 %cd ME-IIS
 !pip install -r env/requirements_colab.txt
 !python scripts/test_me_iis_sanity.py
