@@ -213,6 +213,30 @@ class TestGMMBIC(unittest.TestCase):
         split = cluster_a.size(0)
         self.assertNotEqual(torch.mode(assignments[:split]).values.item(), torch.mode(assignments[split:]).values.item())
 
+    def test_bic_not_at_upper_bound_for_clear_clusters(self) -> None:
+        torch.manual_seed(1)
+        np.random.seed(1)
+        layer = "layer_bic_upper"
+        centers = [torch.tensor([-4.0, 0.0]), torch.tensor([0.0, 4.0]), torch.tensor([4.0, -4.0])]
+        clusters = [c + 0.05 * torch.randn(40, 2) for c in centers]
+        feats = torch.cat(clusters, dim=0)
+
+        adapter = MaxEntAdapter(
+            num_classes=3,
+            layers=[layer],
+            components_per_layer={layer: 1},
+            device=torch.device("cpu"),
+            seed=1,
+            gmm_selection_mode="bic",
+            gmm_bic_min_components=1,
+            gmm_bic_max_components=5,
+        )
+        adapter.fit_target_structure({layer: feats})
+        chosen = adapter.get_components_per_layer()[layer]
+        self.assertGreater(chosen, 1)
+        self.assertLess(chosen, adapter.gmm_bic_max_components)
+        self.assertEqual(adapter.get_components_per_layer_str([layer]), str(chosen))
+
 
 class TestPseudoLabelAdaptation(unittest.TestCase):
     def test_pseudo_label_smoke(self) -> None:

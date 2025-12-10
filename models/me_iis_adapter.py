@@ -98,6 +98,7 @@ class MaxEntAdapter:
         self.gmm_bic_min_components = gmm_bic_min_components
         self.gmm_bic_max_components = gmm_bic_max_components
         self.gmms: Dict[str, GaussianMixture] = self._build_layer_gmms()
+        self.selected_components_per_layer: Dict[str, int] = dict(self.components_per_layer)
         self.unachievable_constraints: List[int] = []
 
     def _build_layer_gmms(self) -> Dict[str, GaussianMixture]:
@@ -114,6 +115,18 @@ class MaxEntAdapter:
     def _refresh_indexer(self) -> None:
         """Rebuild the constraint indexer after component count changes."""
         self.indexer = ConstraintIndexer(self.layers, self.components_per_layer, self.num_classes)
+
+    def get_components_per_layer(self) -> Dict[str, int]:
+        """Return a copy of the per-layer component counts after fitting."""
+        return dict(self.components_per_layer)
+
+    def get_components_per_layer_str(self, layers: Optional[List[str]] = None) -> str:
+        """
+        Return a comma-separated string of component counts aligned with the
+        provided layers (defaults to the adapter order).
+        """
+        order = layers if layers is not None else self.layers
+        return ",".join(str(self.components_per_layer.get(layer, 0)) for layer in order)
 
     def _select_components_via_bic(
         self,
@@ -250,8 +263,14 @@ class MaxEntAdapter:
 
             self.gmms[layer] = gmm
             self.components_per_layer[layer] = int(gmm.n_components)
+            self.selected_components_per_layer[layer] = int(gmm.n_components)
 
         self._refresh_indexer()
+        comp_str = self.get_components_per_layer_str()
+        print(
+            f"[GMM] selection_mode={self.gmm_selection_mode} | components_per_layer={comp_str} "
+            f"(layers order: {','.join(self.layers)})"
+        )
 
     def _predict_gamma(self, layer: str, features: torch.Tensor) -> torch.Tensor:
         feats_np = features.detach().cpu().numpy()

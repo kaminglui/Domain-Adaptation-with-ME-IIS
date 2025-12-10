@@ -17,3 +17,14 @@ Minimal max-entropy importance sampling (ME-IIS) domain adaptation for Office-Ho
 %tensorboard --logdir runs
 ```
 - TensorBoard logs for training and adaptation are written under `runs/` and can be viewed with the commands above.
+
+## ME–IIS Experiment Driver
+Use the experiment driver to sweep constraint layers, GMM complexity, or ME–IIS variants:
+
+```bash
+python scripts/run_me_iis_experiments.py --experiment_family layers --dataset_name office_home --source_domain Ar --target_domain Cl --seeds 0,1,2
+
+python scripts/run_me_iis_experiments.py --experiment_family gmm --dataset_name office_home --source_domain Ar --target_domain Cl --seeds 0,1,2
+
+python scripts/run_me_iis_experiments.py --experiment_family me_iis --dataset_name office_home --source_domain Ar --target_domain Cl --seeds 0,1,2
+```
