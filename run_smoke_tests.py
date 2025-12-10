@@ -19,6 +19,7 @@ from unittest import mock
 
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
+from utils.experiment_utils import build_source_ckpt_path
 from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
 
 
@@ -156,7 +157,7 @@ def _run_dry_runs(cfg: SmokeConfig, workdir: Path) -> None:
     with temporary_workdir(workdir):
         with mock.patch("scripts.train_source.build_model", build_tiny_model):
             train_source.train_source(source_args)
-    ckpt = workdir / "checkpoints" / f"source_only_{cfg.source_domain}_to_{cfg.target_domain}_seed{cfg.seed}.pth"
+    ckpt = workdir / build_source_ckpt_path(cfg.source_domain, cfg.target_domain, cfg.seed)
     if not ckpt.exists():
         raise FileNotFoundError(f"Source-only checkpoint missing: {ckpt}")
 

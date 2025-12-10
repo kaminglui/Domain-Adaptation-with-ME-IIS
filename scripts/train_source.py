@@ -23,6 +23,7 @@ from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
+from utils.experiment_utils import build_source_ckpt_path, dataset_tag, normalize_dataset_name
 
 
 def _save_checkpoint_safe(checkpoint: Dict[str, Any], path: Path) -> None:
@@ -44,11 +45,6 @@ def _save_checkpoint_safe(checkpoint: Dict[str, Any], path: Path) -> None:
         traceback.print_exc()
 
 
-def _build_source_ckpt_path(args: argparse.Namespace) -> Path:
-    # Use Windows-safe filenames: replace "src->tgt" with "src_to_tgt"
-    return Path("checkpoints") / f"source_only_{args.source_domain}_to_{args.target_domain}_seed{args.seed}.pth"
-
-
 def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     preds = torch.argmax(logits, dim=1)
     return float((preds == labels).float().mean().item() * 100.0)
@@ -61,18 +57,6 @@ def _infer_num_classes(loader: DataLoader) -> int:
     if hasattr(dataset, "classes"):
         return len(dataset.classes)  # type: ignore
     raise ValueError("Unable to infer number of classes from dataset.")
-
-
-def _dataset_tag(name: str) -> str:
-    if name == "office_home":
-        return "office-home"
-    if name == "office31":
-        return "office-31"
-    return name
-
-
-def _normalize_dataset_name(name: str) -> str:
-    return name.lower().replace("-", "").replace("_", "").replace(" ", "")
 
 
 def _resolve_officehome_root_from(base: Path) -> Path:
@@ -113,7 +97,7 @@ def _maybe_resolve_data_root(args) -> str:
             return str(explicit)
         print(f"[DATA][WARN] Provided data_root does not exist: {explicit}. Falling back to defaults.")
 
-    name = _normalize_dataset_name(args.dataset_name)
+    name = normalize_dataset_name(args.dataset_name)
 
     if is_colab():
         try:
@@ -184,7 +168,7 @@ def train_source(args) -> None:
     if data_root is not None and not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
 
-    ckpt_path = _build_source_ckpt_path(args)
+    ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed)
     if getattr(args, "resume_from", None) in (None, "") and ckpt_path.exists():
         args.resume_from = str(ckpt_path)
         print(f"[CKPT] Auto-resume: found existing source checkpoint at {ckpt_path}")
@@ -362,7 +346,7 @@ def train_source(args) -> None:
 
         print("[TRAIN] Finished training loop, preparing checkpoint...")
         sys.stdout.flush()
-        ckpt_path = _build_source_ckpt_path(args)
+        ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed)
         checkpoint = {
             "backbone": model.backbone.state_dict(),
             "classifier": model.classifier.state_dict(),
@@ -374,7 +358,7 @@ def train_source(args) -> None:
             "args": vars(args),
         }
         _save_checkpoint_safe(checkpoint, ckpt_path)
-        dataset_field = _dataset_tag(args.dataset_name)
+        dataset_field = dataset_tag(args.dataset_name)
         append_csv(
             path="results/office_home_me_iis.csv",
             fieldnames=OFFICE_HOME_ME_IIS_FIELDS,

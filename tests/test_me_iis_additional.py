@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
 from datasets.domain_loaders import get_domain_loaders
-from models.me_iis_adapter import MaxEntAdapter
+from models.me_iis_adapter import ConstraintIndexer, MaxEntAdapter
 from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
 
 
@@ -185,6 +185,62 @@ class TestFeatureMassAggregation(unittest.TestCase):
         expected_mass = float(len(layers))
         self.assertTrue(torch.allclose(feature_mass, torch.full((num_samples,), expected_mass), atol=1e-6))
         self.assertEqual(flat.shape[1], adapter.indexer.total_constraints)
+
+
+class TestConstraintIndexer(unittest.TestCase):
+    def test_flatten_and_decode(self) -> None:
+        layers = ["layer3", "layer4"]
+        comp_map = {"layer3": 2, "layer4": 1}
+        num_classes = 3
+        indexer = ConstraintIndexer(layers, comp_map, num_classes)
+        num_samples = 2
+        joint = {
+            "layer3": torch.zeros(num_samples, 2, num_classes),
+            "layer4": torch.zeros(num_samples, 1, num_classes),
+        }
+        joint["layer3"][0, 0, 0] = 1.0
+        joint["layer3"][1, 1, 2] = 2.0
+        joint["layer4"][0, 0, 2] = 3.0
+
+        flat = indexer.flatten(joint)
+        self.assertEqual(flat.shape, (num_samples, 9))
+        self.assertEqual(flat[0, 0].item(), 1.0)
+        self.assertEqual(flat[1, 5].item(), 2.0)
+        self.assertEqual(flat[0, 8].item(), 3.0)
+
+        layer, comp_idx, class_idx = indexer.decode(0)
+        self.assertEqual((layer, comp_idx, class_idx), ("layer3", 0, 0))
+        layer, comp_idx, class_idx = indexer.decode(5)
+        self.assertEqual((layer, comp_idx, class_idx), ("layer3", 1, 2))
+        layer, comp_idx, class_idx = indexer.decode(8)
+        self.assertEqual((layer, comp_idx, class_idx), ("layer4", 0, 2))
+        with self.assertRaises(ValueError):
+            indexer.decode(9)
+
+
+class TestAdapterConfiguration(unittest.TestCase):
+    def test_get_components_per_layer_str(self) -> None:
+        comp_map = {"layer3": 2, "layer4": 3, "avgpool": 4}
+        adapter = MaxEntAdapter(
+            num_classes=3,
+            layers=["layer3", "layer4", "avgpool"],
+            components_per_layer=comp_map,
+            device=torch.device("cpu"),
+        )
+        comp_str = adapter.get_components_per_layer_str(["layer3", "layer4", "avgpool"])
+        self.assertEqual(comp_str, "2,3,4")
+
+    def test_invalid_gmm_selection_mode_raises(self) -> None:
+        adapter = MaxEntAdapter(
+            num_classes=2,
+            layers=["layer3"],
+            components_per_layer={"layer3": 1},
+            device=torch.device("cpu"),
+            gmm_selection_mode="badmode",
+        )
+        feats = torch.zeros(4, 2)
+        with self.assertRaises(ValueError):
+            adapter.fit_target_structure({"layer3": feats})
 
 
 class TestGMMBIC(unittest.TestCase):

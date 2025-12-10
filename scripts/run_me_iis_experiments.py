@@ -21,6 +21,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
+from utils.experiment_utils import (
+    build_components_map,
+    build_source_ckpt_path,
+    dataset_tag,
+    parse_feature_layers,
+)
 
 
 SUMMARY_FIELDS = [
@@ -67,45 +73,8 @@ def parse_seeds(seed_str: str) -> List[int]:
     return seeds
 
 
-def _dataset_tag(name: str) -> str:
-    norm = name.lower().replace("-", "").replace("_", "").replace(" ", "")
-    if norm == "officehome":
-        return "office-home"
-    if norm == "office31":
-        return "office-31"
-    return name
-
-
-def _parse_feature_layers(layer_str: str) -> List[str]:
-    layers = [l.strip() for l in layer_str.split(",") if l.strip()]
-    if not layers:
-        raise ValueError("feature_layers must contain at least one layer name.")
-    return layers
-
-
-def _normalize_components_override(override: Optional[str], layers: Sequence[str]) -> Optional[str]:
-    """
-    Accept either colon-based overrides (layer:count,...) or plain comma-separated
-    counts that align with the provided layers.
-    """
-    if not override:
-        return None
-    override = override.strip()
-    if not override:
-        return None
-    if ":" in override:
-        return override
-    counts = [c.strip() for c in override.split(",") if c.strip()]
-    if counts and len(counts) != len(layers):
-        raise ValueError(
-            f"components_per_layer override must match number of layers ({len(layers)}), got {len(counts)} entries."
-        )
-    mapped = [f"{layer}:{counts[idx]}" for idx, layer in enumerate(layers)]
-    return ",".join(mapped)
-
-
-def _uniform_component_override(count: int, layers: Sequence[str]) -> str:
-    return ",".join(f"{layer}:{count}" for layer in layers)
+def _components_map_to_override(feature_layers: Sequence[str], comp_map: Dict[str, int]) -> str:
+    return ",".join(f"{layer}:{comp_map[layer]}" for layer in feature_layers)
 
 
 def read_results_csv(path: Path) -> List[ResultRow]:
@@ -162,11 +131,6 @@ def append_summary_row(path: Path, row: Dict[str, object]) -> None:
         writer.writerow(row)
 
 
-def build_source_ckpt_path(source_domain: str, target_domain: str, seed: int) -> Path:
-    # Mirrors scripts/train_source.py naming for re-use.
-    return Path("checkpoints") / f"source_only_{source_domain}_to_{target_domain}_seed{seed}.pth"
-
-
 def run_source_training(base_args: argparse.Namespace, seed: int) -> ResultRow:
     train_args = argparse.Namespace(
         dataset_name=base_args.dataset_name,
@@ -188,7 +152,7 @@ def run_source_training(base_args: argparse.Namespace, seed: int) -> ResultRow:
     )
     print(f"[Driver] Training/resuming source-only model for seed={seed}")
     train_source.train_source(train_args)
-    dataset_field = _dataset_tag(base_args.dataset_name)
+    dataset_field = dataset_tag(base_args.dataset_name)
     rows = read_results_csv(Path("results") / "office_home_me_iis.csv")
     baseline = latest_result(
         rows=rows,
@@ -208,6 +172,7 @@ def run_adaptation(
     seed: int,
     feature_layers: Sequence[str],
     gmm_selection_mode: str,
+    default_components: int,
     components_override: Optional[str],
     use_pseudo_labels: bool = False,
     pseudo_conf_thresh: Optional[float] = None,
@@ -218,6 +183,10 @@ def run_adaptation(
     method_override: Optional[str] = None,
 ) -> Tuple[ResultRow, str]:
     ckpt_path = build_source_ckpt_path(base_args.source_domain, base_args.target_domain, seed)
+    components_map = build_components_map(feature_layers, default_components, components_override)
+    components_override_str: Optional[str] = None
+    if components_override is not None or gmm_selection_mode == "fixed":
+        components_override_str = _components_map_to_override(feature_layers, components_map)
     adapt_args = argparse.Namespace(
         dataset_name=base_args.dataset_name,
         data_root=base_args.base_data_root,
@@ -226,8 +195,8 @@ def run_adaptation(
         checkpoint=str(ckpt_path),
         batch_size=base_args.batch_size,
         num_workers=base_args.num_workers,
-        num_latent_styles=base_args.num_latent_styles,
-        components_per_layer=components_override,
+        num_latent_styles=default_components,
+        components_per_layer=components_override_str,
         gmm_selection_mode=gmm_selection_mode,
         gmm_bic_min_components=bic_min if bic_min is not None else base_args.gmm_bic_min_components,
         gmm_bic_max_components=bic_max if bic_max is not None else base_args.gmm_bic_max_components,
@@ -253,10 +222,11 @@ def run_adaptation(
     )
     print(
         f"[Driver] Adapting seed={seed} layers={feature_layers} "
-        f"gmm_mode={gmm_selection_mode} components_override={components_override} pseudo={use_pseudo_labels}"
+        f"gmm_mode={gmm_selection_mode} components_override={components_override_str or components_override} "
+        f"pseudo={use_pseudo_labels}"
     )
     adapt_me_iis.adapt_me_iis(adapt_args)
-    dataset_field = _dataset_tag(base_args.dataset_name)
+    dataset_field = dataset_tag(base_args.dataset_name)
     rows = read_results_csv(Path("results") / "office_home_me_iis.csv")
     expected_method = method_override
     if expected_method is None:
@@ -292,14 +262,13 @@ def run_exp_layers(args: argparse.Namespace, seeds: List[int]) -> None:
         print(f"[Exp-layers] Seed={seed} baseline target acc={baseline_acc:.2f}")
         for layers in layer_configs:
             feature_layers = list(layers)
-            comp_override = _normalize_components_override(args.components_per_layer, feature_layers)
-            if comp_override is None and args.gmm_selection_mode == "fixed":
-                comp_override = _uniform_component_override(args.num_latent_styles, feature_layers)
+            comp_override = args.components_per_layer
             adapt_row, comp_str = run_adaptation(
                 base_args=args,
                 seed=seed,
                 feature_layers=feature_layers,
                 gmm_selection_mode=args.gmm_selection_mode,
+                default_components=args.num_latent_styles,
                 components_override=comp_override,
                 use_pseudo_labels=False,
             )
@@ -310,7 +279,7 @@ def run_exp_layers(args: argparse.Namespace, seeds: List[int]) -> None:
             append_summary_row(
                 Path(args.output_csv),
                 {
-                    "dataset": _dataset_tag(args.dataset_name),
+                    "dataset": dataset_tag(args.dataset_name),
                     "source": args.source_domain,
                     "target": args.target_domain,
                     "seed": seed,
@@ -329,7 +298,7 @@ def run_exp_layers(args: argparse.Namespace, seeds: List[int]) -> None:
 
 
 def run_exp_gmm(args: argparse.Namespace, seeds: List[int]) -> None:
-    best_layers = _parse_feature_layers(args.feature_layers)
+    best_layers = parse_feature_layers(args.feature_layers)
     gmm_configs = [
         {"mode": "fixed", "components": 2},
         {"mode": "fixed", "components": 5},
@@ -345,13 +314,16 @@ def run_exp_gmm(args: argparse.Namespace, seeds: List[int]) -> None:
             comp_override = None
             bic_min = cfg.get("bic_min")
             bic_max = cfg.get("bic_max")
+            default_components = int(cfg["components"]) if cfg["components"] is not None else args.num_latent_styles
             if mode == "fixed":
-                comp_override = _uniform_component_override(int(cfg["components"]), best_layers)
+                comp_map = build_components_map(best_layers, default_components, None)
+                comp_override = _components_map_to_override(best_layers, comp_map)
             adapt_row, comp_str = run_adaptation(
                 base_args=args,
                 seed=seed,
                 feature_layers=best_layers,
                 gmm_selection_mode=mode,
+                default_components=default_components,
                 components_override=comp_override,
                 use_pseudo_labels=False,
                 bic_min=bic_min,
@@ -364,7 +336,7 @@ def run_exp_gmm(args: argparse.Namespace, seeds: List[int]) -> None:
             append_summary_row(
                 Path(args.output_csv),
                 {
-                    "dataset": _dataset_tag(args.dataset_name),
+                    "dataset": dataset_tag(args.dataset_name),
                     "source": args.source_domain,
                     "target": args.target_domain,
                     "seed": seed,
@@ -383,7 +355,7 @@ def run_exp_gmm(args: argparse.Namespace, seeds: List[int]) -> None:
 
 
 def run_exp_me_iis(args: argparse.Namespace, seeds: List[int]) -> None:
-    best_layers = _parse_feature_layers(args.feature_layers)
+    best_layers = parse_feature_layers(args.feature_layers)
     for seed in seeds:
         baseline = run_source_training(args, seed)
         baseline_acc = baseline.target_acc
@@ -392,7 +364,7 @@ def run_exp_me_iis(args: argparse.Namespace, seeds: List[int]) -> None:
         append_summary_row(
             Path(args.output_csv),
             {
-                "dataset": _dataset_tag(args.dataset_name),
+                "dataset": dataset_tag(args.dataset_name),
                 "source": args.source_domain,
                 "target": args.target_domain,
                 "seed": seed,
@@ -409,21 +381,20 @@ def run_exp_me_iis(args: argparse.Namespace, seeds: List[int]) -> None:
             },
         )
 
-        comp_override = _normalize_components_override(args.components_per_layer, best_layers)
-        if comp_override is None and args.gmm_selection_mode == "fixed":
-            comp_override = _uniform_component_override(args.num_latent_styles, best_layers)
+        comp_override = args.components_per_layer
         adapt_row, comp_str = run_adaptation(
             base_args=args,
             seed=seed,
             feature_layers=best_layers,
             gmm_selection_mode=args.gmm_selection_mode,
+            default_components=args.num_latent_styles,
             components_override=comp_override,
             use_pseudo_labels=False,
         )
         append_summary_row(
             Path(args.output_csv),
             {
-                "dataset": _dataset_tag(args.dataset_name),
+                "dataset": dataset_tag(args.dataset_name),
                 "source": args.source_domain,
                 "target": args.target_domain,
                 "seed": seed,
@@ -445,13 +416,14 @@ def run_exp_me_iis(args: argparse.Namespace, seeds: List[int]) -> None:
             seed=seed,
             feature_layers=best_layers,
             gmm_selection_mode=args.gmm_selection_mode,
+            default_components=args.num_latent_styles,
             components_override=comp_override,
             use_pseudo_labels=True,
         )
         append_summary_row(
             Path(args.output_csv),
             {
-                "dataset": _dataset_tag(args.dataset_name),
+                "dataset": dataset_tag(args.dataset_name),
                 "source": args.source_domain,
                 "target": args.target_domain,
                 "seed": seed,

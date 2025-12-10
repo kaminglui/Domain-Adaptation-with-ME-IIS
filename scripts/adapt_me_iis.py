@@ -27,6 +27,7 @@ from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.feature_utils import extract_features
 from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
+from utils.experiment_utils import build_components_map, dataset_tag, normalize_dataset_name, parse_feature_layers
 from torchvision import datasets
 
 
@@ -130,34 +131,6 @@ class PseudoLabeledDataset(Subset):
         return image, label
 
 
-def _parse_feature_layers(layer_str: str) -> Tuple[str, ...]:
-    layers = tuple([l.strip() for l in layer_str.split(",") if l.strip()])
-    if not layers:
-        raise ValueError("At least one feature layer must be specified (e.g., 'layer3,layer4,avgpool').")
-    return layers
-
-
-def _build_component_map(
-    feature_layers: Iterable[str], override: str, default_components: int
-) -> Dict[str, int]:
-    comp_map = {layer: default_components for layer in feature_layers}
-    if override:
-        for item in override.split(","):
-            if not item:
-                continue
-            if ":" not in item:
-                raise ValueError(f"Invalid components_per_layer entry '{item}'. Use 'layer:count'.")
-            name, count = item.split(":")
-            name = name.strip()
-            if name not in comp_map:
-                raise ValueError(f"Got components override for unknown layer '{name}'.")
-            comp_map[name] = int(count)
-    for layer, count in comp_map.items():
-        if count <= 0:
-            raise ValueError(f"Number of components for {layer} must be positive, got {count}.")
-    return comp_map
-
-
 def _num_classes_from_dataset(dataset: Dataset) -> int:
     base = dataset
     while isinstance(base, Subset):
@@ -167,18 +140,6 @@ def _num_classes_from_dataset(dataset: Dataset) -> int:
     if hasattr(base, "dataset") and hasattr(base.dataset, "classes"):
         return len(base.dataset.classes)  # type: ignore
     raise ValueError("Unable to infer number of classes from dataset.")
-
-
-def _dataset_tag(name: str) -> str:
-    if name == "office_home":
-        return "office-home"
-    if name == "office31":
-        return "office-31"
-    return name
-
-
-def _normalize_dataset_name(name: str) -> str:
-    return name.lower().replace("-", "").replace("_", "").replace(" ", "")
 
 
 def _resolve_officehome_root_from(base: Path) -> Path:
@@ -219,7 +180,7 @@ def _maybe_resolve_data_root(args) -> str:
             return str(explicit)
         print(f"[DATA][WARN] Provided data_root does not exist: {explicit}. Falling back to defaults.")
 
-    name = _normalize_dataset_name(args.dataset_name)
+    name = normalize_dataset_name(args.dataset_name)
 
     if is_colab():
         try:
@@ -441,8 +402,8 @@ def adapt_me_iis(args) -> None:
     device = get_device(deterministic=args.deterministic)
     data_generator = make_generator(args.seed)
     worker_init = make_worker_init_fn(args.seed)
-    feature_layers = _parse_feature_layers(args.feature_layers)
-    components_map = _build_component_map(feature_layers, args.components_per_layer, args.num_latent_styles)
+    feature_layers = parse_feature_layers(args.feature_layers)
+    components_map = build_components_map(feature_layers, args.num_latent_styles, args.components_per_layer)
     components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
     total_components = sum(components_map.values())
     layer_tag = "-".join(feature_layers)
@@ -799,7 +760,7 @@ def adapt_me_iis(args) -> None:
         adapt_ckpt = _build_adapt_ckpt_path(args, layer_tag)
         _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), adapt_ckpt)
 
-        dataset_field = _dataset_tag(args.dataset_name)
+        dataset_field = dataset_tag(args.dataset_name)
         method_tag = "me_iis"
         if args.use_pseudo_labels:
             method_tag = "me_iis_pl"
