@@ -18,8 +18,6 @@ ME‑IIS implements max-entropy importance sampling for unsupervised domain adap
 - [Project Layout](#project-layout)
 - [Folder-level Documentation](#folder-level-documentation)
 - [Contributing](#contributing)
-- [License](#license)
-- [Contact / Support](#contact--support)
 
 ## Installation
 - Python 3.10+ recommended.
