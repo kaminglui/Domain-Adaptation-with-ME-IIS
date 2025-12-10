@@ -28,3 +28,5 @@ python scripts/run_me_iis_experiments.py --experiment_family gmm --dataset_name 
 
 python scripts/run_me_iis_experiments.py --experiment_family me_iis --dataset_name office_home --source_domain Ar --target_domain Cl --seeds 0,1,2
 ```
+
+- Default `layers` experiments sweep `layer4` and `layer3,layer4`. The `layer3+layer4` combo kept spatial/style cues and performed best in our tests. Adding `avgpool` by default hurt accuracy, so treat it as an opt-in variant if you need it.

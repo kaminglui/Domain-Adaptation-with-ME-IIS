@@ -379,9 +379,33 @@ def train_source(args) -> None:
                 "finetune_backbone": True,
                 "backbone_lr_scale": 1.0,
                 "classifier_lr": args.lr_classifier,
-                "source_prob_mode": "",
-            },
-        )
+            "source_prob_mode": "",
+        },
+    )
+        if getattr(args, "eval_on_source_self", False):
+            try:
+                import scripts.eval_source_only as eval_source_only
+
+                eval_args = argparse.Namespace(
+                    dataset_name=args.dataset_name,
+                    data_root=args.data_root,
+                    domain=args.source_domain,
+                    checkpoint=str(ckpt_path),
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    seed=args.seed,
+                    deterministic=args.deterministic,
+                    results_csv=getattr(args, "eval_results_csv", str(Path("results") / "office_home_me_iis.csv")),
+                    append_results=True,
+                )
+                self_acc = eval_source_only.eval_source_only(eval_args)
+                print(
+                    f"[EVAL][source-self] {args.dataset_name} "
+                    f"{args.source_domain}->{args.source_domain} acc={self_acc:.2f}"
+                )
+            except Exception as eval_exc:
+                print(f"[EVAL][WARN] Source-self evaluation failed: {eval_exc}")
+                traceback.print_exc()
     finally:
         writer.close()
         print(f"[TENSORBOARD] Logs written to {log_dir}")
@@ -442,6 +466,17 @@ def parse_args():
         type=int,
         default=0,
         help="If >0, limit the number of samples per domain (for very fast dry-runs).",
+    )
+    parser.add_argument(
+        "--eval_on_source_self",
+        action="store_true",
+        help="If set, evaluate the source-only checkpoint on the source domain (e.g., Art→Art).",
+    )
+    parser.add_argument(
+        "--eval_results_csv",
+        type=str,
+        default=str(Path("results") / "office_home_me_iis.csv"),
+        help="Optional CSV path to append the source-self accuracy when --eval_on_source_self is used.",
     )
     return parser.parse_args()
 

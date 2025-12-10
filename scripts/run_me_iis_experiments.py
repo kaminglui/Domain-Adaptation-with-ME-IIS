@@ -252,9 +252,7 @@ def run_adaptation(
 def run_exp_layers(args: argparse.Namespace, seeds: List[int]) -> None:
     layer_configs: List[Tuple[str, ...]] = [
         ("layer4",),
-        ("avgpool",),
         ("layer3", "layer4"),
-        ("layer3", "layer4", "avgpool"),
     ]
     for seed in seeds:
         baseline = run_source_training(args, seed)
@@ -477,7 +475,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gmm_bic_min_components", type=int, default=2)
     parser.add_argument("--gmm_bic_max_components", type=int, default=15)
-    parser.add_argument("--feature_layers", type=str, default="layer3,layer4,avgpool")
+    parser.add_argument("--feature_layers", type=str, default="layer3,layer4")
     parser.add_argument("--source_prob_mode", type=str, default="softmax", choices=["softmax", "onehot"])
     parser.add_argument("--iis_iters", type=int, default=15)
     parser.add_argument("--iis_tol", type=float, default=1e-3)

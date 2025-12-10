@@ -847,7 +847,7 @@ def parse_args():
     parser.add_argument(
         "--feature_layers",
         type=str,
-        default="layer3,layer4,avgpool",
+        default="layer3,layer4",
         help="Comma-separated ResNet-50 layers to include in ME-IIS constraints.",
     )
     parser.add_argument(
