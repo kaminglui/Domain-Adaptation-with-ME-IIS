@@ -78,13 +78,11 @@ python scripts/adapt_me_iis.py --dataset_name office_home --data_root datasets/O
 - `ME_IIS_Colab.ipynb` – Colab pipeline.
 
 ## Folder-level Documentation
-- [checkpoints](checkpoints/README.md)
+- checkpoints
 - [datasets](datasets/README.md)
-- [datasets/Office-31](datasets/Office-31/README.md)
-- [datasets/Office-Home](datasets/Office-Home/README.md)
 - [env](env/README.md)
 - [models](models/README.md)
-- [results](results/README.md)
+- results
 - [scripts](scripts/README.md)
 - [tests](tests/README.md)
 - [utils](utils/README.md)
