@@ -1,4 +1,5 @@
 # ME‑IIS Domain Adaptation
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb)
 
 ## Overview
 ME‑IIS implements max-entropy importance sampling for unsupervised domain adaptation on Office-Home and Office-31. It trains a ResNet-50 source classifier, reweights source samples via IIS using style×class constraints, and optionally fine-tunes with pseudo-labels. A Colab notebook and an experiment driver provide end-to-end pipelines, including source-only health checks.
@@ -31,6 +32,8 @@ ME‑IIS implements max-entropy importance sampling for unsupervised domain adap
 - Datasets: place Office-Home under `datasets/Office-Home` or Office-31 under `datasets/Office-31`, or let KaggleHub fetch them on Colab.
 
 ## Quickstart / Getting Started
+Open the two-stage pseudo-label notebook directly in Colab: [ME_IIS_Colab.ipynb](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb).
+
 Train source model (Ar→Cl):
 ```bash
 python scripts/train_source.py --dataset_name office_home \
