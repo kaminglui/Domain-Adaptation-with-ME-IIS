@@ -61,7 +61,7 @@ class TestIISKnownSolution(unittest.TestCase):
         self.assertAlmostEqual(weights.sum().item(), 1.0, places=6)
         self.assertTrue(torch.all(weights >= 0))
         self.assertTrue(final_error < 1e-4)
-        expected = torch.tensor([0.8, 0.2])
+        expected = torch.tensor([0.8, 0.2], dtype=weights.dtype)
         self.assertTrue(torch.allclose(weights.cpu(), expected, atol=1e-3))
 
 
@@ -183,7 +183,8 @@ class TestFeatureMassAggregation(unittest.TestCase):
 
         flat, feature_mass = adapter._validate_joint_features(joint, name="joint", rel_mass_tol=1e-6)
         expected_mass = float(len(layers))
-        self.assertTrue(torch.allclose(feature_mass, torch.full((num_samples,), expected_mass), atol=1e-6))
+        expected_tensor = torch.full((num_samples,), expected_mass, dtype=feature_mass.dtype, device=feature_mass.device)
+        self.assertTrue(torch.allclose(feature_mass, expected_tensor, atol=1e-6))
         self.assertEqual(flat.shape[1], adapter.indexer.total_constraints)
 
 

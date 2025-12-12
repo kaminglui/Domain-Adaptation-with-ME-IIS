@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from sklearn.cluster import KMeans
 
-from clustering.base import ClusteringBackend
+from clustering.base import LatentBackend
 from utils.normalization import l2_normalize
 
 
@@ -20,7 +20,7 @@ class VMFSoftmaxConfig:
     eps: float = 1e-12
 
 
-class VMFSoftmaxBackend(ClusteringBackend):
+class VMFSoftmaxBackend(LatentBackend):
     """Softmax over cosine similarities to KMeans prototypes (spherical vMF analogue)."""
 
     def __init__(self, n_components: int, config: Optional[VMFSoftmaxConfig] = None):

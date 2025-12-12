@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from sklearn.mixture import GaussianMixture
 
-from clustering.base import ClusteringBackend
+from clustering.base import LatentBackend
 
 
 @dataclass
@@ -21,7 +21,7 @@ class GMMBackendConfig:
     reg_covar: float = 1e-6
 
 
-class GMMBackend(ClusteringBackend):
+class GMMBackend(LatentBackend):
     """Wraps sklearn GaussianMixture with optional BIC-based component selection."""
 
     def __init__(

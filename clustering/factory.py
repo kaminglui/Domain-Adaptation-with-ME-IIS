@@ -4,7 +4,7 @@ Factory helpers to build clustering backends from configuration.
 
 from typing import Optional
 
-from clustering.base import ClusteringBackend
+from clustering.base import LatentBackend
 from clustering.gmm_backend import GMMBackend, GMMBackendConfig
 from clustering.vmf_softmax_backend import VMFSoftmaxBackend, VMFSoftmaxConfig
 
@@ -19,7 +19,7 @@ def create_backend(
     gmm_bic_max_components: int = 8,
     kmeans_n_init: int = 10,
     vmf_kappa: float = 20.0,
-) -> ClusteringBackend:
+) -> LatentBackend:
     """
     Build a clustering backend instance based on a string identifier.
 

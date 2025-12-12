@@ -1,206 +1,151 @@
+import unittest
+
 import numpy as np
-import pytest
 import torch
+import torch.nn.functional as F
 from torch.testing import assert_allclose
 
 from clustering.vmf_softmax_backend import VMFSoftmaxBackend, VMFSoftmaxConfig
-from models.me_iis_adapter import MaxEntAdapter
-from utils.entropy import prediction_entropy
+from models.iis_components import IISUpdater, JointConstraintBuilder
 from utils.normalization import l2_normalize
 
 
-def _one_layer_joint_from_components(components: torch.Tensor) -> dict:
-    return {"layer": components.unsqueeze(2)}
+class TestLatentBackendAndConstraints(unittest.TestCase):
+    def test_vmf_softmax_pmf_sums_to_one(self) -> None:
+        X = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+        cfg = VMFSoftmaxConfig(kappa=2.5, random_state=0, kmeans_n_init=1, eps=1e-12)
+        backend = VMFSoftmaxBackend(n_components=2, config=cfg)
+        backend.fit(X)
+        probs = backend.predict_proba(X)
+
+        # Row sums must be 1 within numerical tolerance.
+        np.testing.assert_allclose(probs.sum(axis=1), np.ones(probs.shape[0]), rtol=0, atol=1e-12)
+
+        # Manual softmax over cosine similarities (explicit loops for clarity).
+        X_norm = l2_normalize(X, axis=1, eps=cfg.eps)
+        manual = np.zeros_like(probs)
+        for i in range(X_norm.shape[0]):
+            sims = []
+            for k in range(backend.centroids_.shape[0]):
+                sims.append(np.dot(X_norm[i], backend.centroids_[k]))
+            logits = cfg.kappa * np.array(sims, dtype=np.float64)
+            logits -= np.max(logits)
+            exp_logits = np.exp(logits)
+            manual[i] = exp_logits / exp_logits.sum()
+        np.testing.assert_allclose(probs, manual, rtol=0, atol=1e-12)
+
+    def test_joint_constraint_mass_is_Nc(self) -> None:
+        device = torch.device("cpu")
+        layers = ["l0", "l1"]
+        comps = {"l0": 2, "l1": 2}
+        class_probs = torch.tensor([[0.2, 0.8], [0.5, 0.5]], dtype=torch.float64, device=device)
+        resp = {
+            "l0": torch.tensor([[0.6, 0.4], [0.1, 0.9]], dtype=torch.float64, device=device),
+            "l1": torch.tensor([[0.3, 0.7], [0.25, 0.75]], dtype=torch.float64, device=device),
+        }
+        builder = JointConstraintBuilder(layers=layers, components_per_layer=comps, num_classes=2, device=device)
+        joint = builder.build_joint_from_responsibilities(resp, class_probs)
+        flat, feature_mass = builder.validate_and_flatten(joint, rel_mass_tol=1e-12)
+
+        # For each sample and latent i, sum_{j,c} joint_{i,j,c}(t) = 1, hence sum_{i,j,c} = N_c.
+        with torch.no_grad():
+            per_layer_mass = torch.stack([joint["l0"].sum(dim=(1, 2)), joint["l1"].sum(dim=(1, 2))], dim=1)
+            assert_allclose(per_layer_mass, torch.ones_like(per_layer_mass), rtol=0, atol=1e-12)
+            expected_total = torch.full((class_probs.shape[0],), float(len(layers)), dtype=torch.float64)
+            assert_allclose(feature_mass.cpu(), expected_total, rtol=0, atol=1e-12)
+            expected_total_mass = torch.full((class_probs.shape[0],), float(len(layers)), dtype=torch.float64)
+            assert_allclose(flat.sum(dim=1).cpu(), expected_total_mass, rtol=0, atol=1e-12)
+
+    def test_pg_latent_matches_eq14(self) -> None:
+        device = torch.device("cpu")
+        layers = ["layer"]
+        comps = {"layer": 2}
+        labels = torch.tensor([0, 1, 0], dtype=torch.long, device=device)
+        class_probs = F.one_hot(labels, num_classes=2).to(dtype=torch.float64)
+        resp = {"layer": torch.tensor([[0.8, 0.2], [0.1, 0.9], [0.3, 0.7]], dtype=torch.float64, device=device)}
+        builder = JointConstraintBuilder(layers=layers, components_per_layer=comps, num_classes=2, device=device)
+        joint = builder.build_joint_from_responsibilities(resp, class_probs)
+        flat, _ = builder.validate_and_flatten(joint, rel_mass_tol=1e-12)
+        iis = IISUpdater(num_latent=len(layers), num_discrete=0, eps=1e-12)
+        pg_repo = iis.compute_pg(flat)
+
+        manual = np.zeros((comps["layer"], 2), dtype=np.float64)
+        T = labels.shape[0]
+        for t in range(T):
+            for j in range(comps["layer"]):
+                for c in range(2):
+                    manual[j, c] += (1 if labels[t].item() == c else 0) * resp["layer"][t, j].item()
+        manual /= float(T)
+        np.testing.assert_allclose(pg_repo.cpu().numpy(), manual.reshape(-1), rtol=0, atol=1e-12)
+
+    def test_pm_latent_matches_eq15_under_source_hard_labels(self) -> None:
+        device = torch.device("cpu")
+        layers = ["layer"]
+        comps = {"layer": 2}
+        labels = torch.tensor([1, 0, 1], dtype=torch.long, device=device)
+        class_probs = F.one_hot(labels, num_classes=2).to(dtype=torch.float64)
+        resp = {"layer": torch.tensor([[0.4, 0.6], [0.7, 0.3], [0.2, 0.8]], dtype=torch.float64, device=device)}
+        builder = JointConstraintBuilder(layers=layers, components_per_layer=comps, num_classes=2, device=device)
+        joint = builder.build_joint_from_responsibilities(resp, class_probs)
+        flat, _ = builder.validate_and_flatten(joint, rel_mass_tol=1e-12)
+        weights = torch.tensor([0.2, 0.5, 0.3], dtype=torch.float64, device=device)
+        iis = IISUpdater(num_latent=len(layers), num_discrete=0, eps=1e-12)
+        pm_repo = iis.compute_pm(weights, flat)
+
+        manual = np.zeros((comps["layer"], 2), dtype=np.float64)
+        for t in range(labels.shape[0]):
+            for j in range(comps["layer"]):
+                for c in range(2):
+                    manual[j, c] += weights[t].item() * resp["layer"][t, j].item() * (1 if labels[t].item() == c else 0)
+        np.testing.assert_allclose(pm_repo.cpu().numpy(), manual.reshape(-1), rtol=0, atol=1e-12)
+
+    def test_iis_delta_lambda_matches_eq18(self) -> None:
+        device = torch.device("cpu")
+        pg = torch.tensor([0.3, 0.2, 0.1, 0.4], dtype=torch.float64, device=device)
+        pm = torch.tensor([0.25, 0.25, 0.2, 0.3], dtype=torch.float64, device=device)
+        iis = IISUpdater(num_latent=2, num_discrete=0, eps=1e-12)
+        delta = iis.delta_lambda(pg, pm)
+        expected = torch.log(torch.clamp(pg, min=1e-12) / torch.clamp(pm, min=1e-12)) / float(iis.mass_constant)
+        assert_allclose(delta.cpu(), expected.cpu(), rtol=0, atol=1e-12)
+
+    def test_single_iis_step_updates_weights_correctly(self) -> None:
+        device = torch.device("cpu")
+        layers = ["l0", "l1"]
+        comps = {"l0": 2, "l1": 2}
+        builder = JointConstraintBuilder(layers=layers, components_per_layer=comps, num_classes=1, device=device)
+
+        class_probs = torch.ones((2, 1), dtype=torch.float64, device=device)
+        source_resp = {
+            "l0": torch.tensor([[0.6, 0.4], [0.2, 0.8]], dtype=torch.float64, device=device),
+            "l1": torch.tensor([[0.7, 0.3], [0.25, 0.75]], dtype=torch.float64, device=device),
+        }
+        target_resp = {
+            "l0": torch.tensor([[0.5, 0.5], [0.3, 0.7]], dtype=torch.float64, device=device),
+            "l1": torch.tensor([[0.6, 0.4], [0.4, 0.6]], dtype=torch.float64, device=device),
+        }
+        source_joint = builder.build_joint_from_responsibilities(source_resp, class_probs)
+        target_joint = builder.build_joint_from_responsibilities(target_resp, class_probs)
+        source_flat, _ = builder.validate_and_flatten(source_joint, rel_mass_tol=1e-12)
+        target_flat, _ = builder.validate_and_flatten(target_joint, rel_mass_tol=1e-12)
+
+        iis = IISUpdater(num_latent=len(layers), num_discrete=0, eps=1e-12)
+        pg = iis.compute_pg(target_flat)
+        weights = torch.full((source_flat.shape[0],), 1.0 / source_flat.shape[0], dtype=torch.float64, device=device)
+        pm = iis.compute_pm(weights, source_flat)
+        delta_expected = torch.log(pg / pm) / float(iis.mass_constant)
+
+        step_result = iis.step(weights, source_flat, pg)
+        weights_manual = weights * torch.exp(torch.sum(source_flat * delta_expected.unsqueeze(0), dim=1))
+        weights_manual = torch.clamp(weights_manual, min=0.0)
+        weights_manual = weights_manual / weights_manual.sum()
+        assert_allclose(step_result.delta, delta_expected, rtol=0, atol=1e-12)
+        assert_allclose(step_result.updated_weights, weights_manual, rtol=0, atol=1e-12)
+
+        pm_updated = iis.compute_pm(step_result.updated_weights, source_flat)
+        l1_before = torch.norm(pg - pm, p=1)
+        l1_after = torch.norm(pg - pm_updated, p=1)
+        self.assertLessEqual(float(l1_after), float(l1_before) + 1e-12)
 
 
-def test_l2_normalize_unit_length() -> None:
-    X = np.array([[3.0, 4.0], [0.0, 0.0], [-1.0, 2.0]])
-    normed = l2_normalize(X, axis=1, eps=1e-12)
-    norms = np.linalg.norm(normed, axis=1)
-    assert_allclose(norms[[0, 2]], np.ones(2), rtol=0, atol=1e-12)
-    assert np.allclose(normed[1], np.zeros_like(normed[1]))
-
-
-def test_entropy_matches_definition() -> None:
-    probs = np.array([[0.1, 0.6, 0.3], [0.5, 0.25, 0.25]], dtype=np.float64)
-    eps = 1e-12
-    manual = -np.sum(probs * np.log(probs + eps), axis=1)
-    computed = prediction_entropy(probs, eps=eps)
-    np.testing.assert_allclose(computed, manual, rtol=0, atol=1e-12)
-
-
-def test_vmf_softmax_matches_manual_softmax() -> None:
-    X = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
-    cfg = VMFSoftmaxConfig(kappa=2.0, random_state=0, kmeans_n_init=1, eps=1e-12)
-    backend = VMFSoftmaxBackend(n_components=2, config=cfg)
-    backend.fit(X)
-    probs = backend.predict_proba(X)
-
-    X_norm = l2_normalize(X, axis=1, eps=cfg.eps)
-    sims = X_norm @ backend.centroids_.T
-    logits = cfg.kappa * sims
-    logits = logits - logits.max(axis=1, keepdims=True)
-    exp_logits = np.exp(logits)
-    manual = exp_logits / exp_logits.sum(axis=1, keepdims=True)
-    np.testing.assert_allclose(probs, manual, rtol=0, atol=1e-12)
-
-
-def test_vmf_softmax_rows_sum_to_one_and_nonnegative() -> None:
-    rng = np.random.default_rng(1)
-    X = rng.standard_normal((5, 3))
-    cfg = VMFSoftmaxConfig(kappa=5.0, random_state=1, kmeans_n_init=4, eps=1e-12)
-    backend = VMFSoftmaxBackend(n_components=3, config=cfg)
-    backend.fit(X)
-    probs = backend.predict_proba(X)
-    assert probs.min() >= -1e-15
-    np.testing.assert_allclose(probs.sum(axis=1), np.ones(probs.shape[0]), rtol=0, atol=1e-12)
-
-
-def test_joint_features_gamma_times_class_probs() -> None:
-    gamma = torch.tensor([[0.2, 0.8], [0.5, 0.5]], dtype=torch.float64)
-    class_probs = torch.tensor([[0.1, 0.9, 0.0], [0.3, 0.3, 0.4]], dtype=torch.float64)
-    joint = gamma.unsqueeze(2) * class_probs.unsqueeze(1)
-    manual = torch.zeros_like(joint)
-    for n in range(gamma.size(0)):
-        for j in range(gamma.size(1)):
-            for k in range(class_probs.size(1)):
-                manual[n, j, k] = gamma[n, j] * class_probs[n, k]
-    assert torch.allclose(joint, manual, atol=1e-12)
-
-
-def test_target_moments_are_mean_of_joint_features() -> None:
-    adapter = MaxEntAdapter(
-        num_classes=2, layers=["layer"], components_per_layer={"layer": 2}, device=torch.device("cpu")
-    )
-    gamma = torch.tensor([[0.6, 0.4], [0.3, 0.7]], dtype=torch.float64)
-    class_probs = torch.tensor([[0.5, 0.5], [0.25, 0.75]], dtype=torch.float64)
-    joint_tensor = gamma.unsqueeze(2) * class_probs.unsqueeze(1)
-    joint = {"layer": joint_tensor.clone()}
-    flat, _ = adapter._validate_joint_features(joint, name="joint", rel_mass_tol=1e-10)
-    expected = joint_tensor.reshape(joint_tensor.shape[0], -1).mean(dim=0)
-    assert torch.allclose(flat.mean(dim=0), expected, atol=1e-12)
-
-
-def test_iis_single_step_matches_manual() -> None:
-    device = torch.device("cpu")
-    adapter = MaxEntAdapter(
-        num_classes=1, layers=["layer"], components_per_layer={"layer": 2}, device=device, seed=0
-    )
-    source_components = torch.tensor([[0.6, 0.4], [0.2, 0.8]], dtype=torch.float64)
-    target_components = torch.tensor([[0.7, 0.3], [0.5, 0.5]], dtype=torch.float64)
-    source_joint = _one_layer_joint_from_components(source_components)
-    target_joint = _one_layer_joint_from_components(target_components)
-
-    weights, _, _ = adapter.solve_iis_from_joint(
-        source_joint=source_joint,
-        target_joint=target_joint,
-        max_iter=1,
-        iis_tol=0.0,
-        f_mass_rel_tol=1e-12,
-    )
-
-    source_flat, feature_mass = adapter._validate_joint_features(
-        source_joint, name="source_joint", rel_mass_tol=1e-12
-    )
-    target_flat, _ = adapter._validate_joint_features(target_joint, name="target_joint", rel_mass_tol=1e-12)
-    target_moments = target_flat.to(device).mean(dim=0)
-    eps = 1e-8
-    weights_manual = torch.ones(source_flat.size(0), dtype=source_flat.dtype) / float(source_flat.size(0))
-    mass_constant = float(feature_mass.mean().item())
-    current_moments = torch.sum(weights_manual.view(-1, 1) * source_flat, dim=0)
-    ratio = torch.ones_like(current_moments)
-    active_mask = (target_moments > eps) | (current_moments > eps)
-    ratio[active_mask] = (target_moments[active_mask] + eps) / (current_moments[active_mask] + eps)
-    ratio = torch.clamp(ratio, min=1e-6, max=1e6)
-    delta_update = torch.zeros_like(current_moments)
-    delta_update[active_mask] = torch.log(ratio[active_mask]) / (mass_constant + eps)
-    exponent = torch.sum(source_flat * delta_update.unsqueeze(0), dim=1)
-    expected_weights = weights_manual * torch.exp(exponent)
-    expected_weights = torch.clamp(expected_weights, min=0.0)
-    expected_weights = expected_weights / expected_weights.sum()
-
-    assert_allclose(weights.cpu(), expected_weights.cpu(), rtol=0, atol=1e-12)
-
-
-def test_iis_weights_are_probability_distribution() -> None:
-    adapter = MaxEntAdapter(
-        num_classes=1, layers=["layer"], components_per_layer={"layer": 2}, device=torch.device("cpu"), seed=0
-    )
-    source_components = torch.tensor([[0.6, 0.4], [0.2, 0.8]], dtype=torch.float64)
-    target_components = torch.tensor([[0.9, 0.1], [0.4, 0.6]], dtype=torch.float64)
-    source_joint = _one_layer_joint_from_components(source_components)
-    target_joint = _one_layer_joint_from_components(target_components)
-
-    weights, _, history = adapter.solve_iis_from_joint(
-        source_joint=source_joint,
-        target_joint=target_joint,
-        max_iter=4,
-        iis_tol=0.0,
-        f_mass_rel_tol=1e-12,
-    )
-    assert torch.isfinite(weights).all()
-    assert float(weights.sum().item()) == pytest.approx(1.0, rel=0, abs=1e-12)
-    assert float(weights.min().item()) >= 0.0
-    assert history[-1].max_moment_error >= 0.0
-
-
-def test_feature_mass_constant_for_valid_gamma_and_class_probs() -> None:
-    layers = ["a", "b"]
-    comps = {layer: 2 for layer in layers}
-    adapter = MaxEntAdapter(num_classes=3, layers=layers, components_per_layer=comps, device=torch.device("cpu"))
-    gamma = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.2, 0.8]], dtype=torch.float64)
-    class_probs = torch.tensor(
-        [[0.1, 0.7, 0.2], [0.2, 0.3, 0.5], [0.3, 0.1, 0.6]],
-        dtype=torch.float64,
-    )
-    joint = {layer: gamma.unsqueeze(2) * class_probs.unsqueeze(1) for layer in layers}
-    _, feature_mass = adapter._validate_joint_features(joint, name="joint", rel_mass_tol=1e-10)
-    expected_mass = torch.full((gamma.size(0),), float(len(layers)), dtype=feature_mass.dtype)
-    assert torch.allclose(feature_mass, expected_mass, atol=1e-12)
-
-
-def test_adapter_runs_with_vmf_backend_small_synthetic() -> None:
-    torch.manual_seed(0)
-    device = torch.device("cpu")
-    adapter = MaxEntAdapter(
-        num_classes=2,
-        layers=["layer"],
-        components_per_layer={"layer": 2},
-        device=device,
-        seed=0,
-        cluster_backend="vmf_softmax",
-        vmf_kappa=15.0,
-        kmeans_n_init=4,
-    )
-
-    source_feats = {"layer": torch.tensor([[1.0, 0.0], [0.9, 0.1], [-1.0, 0.0], [-0.9, -0.1]], dtype=torch.float64)}
-    target_feats = {"layer": torch.tensor([[1.0, 0.0], [1.0, 0.2], [-1.0, -0.1]], dtype=torch.float64)}
-    source_class_probs = torch.tensor(
-        [[0.9, 0.1], [0.85, 0.15], [0.2, 0.8], [0.15, 0.85]], dtype=torch.float64
-    )
-    target_class_probs = torch.tensor([[0.7, 0.3], [0.6, 0.4], [0.1, 0.9]], dtype=torch.float64)
-
-    adapter.fit_target_structure(target_feats, target_class_probs=target_class_probs)
-
-    source_joint = adapter.get_joint_features(source_feats, source_class_probs)
-    target_joint = adapter.get_joint_features(target_feats, target_class_probs)
-    target_flat, _ = adapter._validate_joint_features(target_joint, name="target_joint", rel_mass_tol=1e-6)
-    source_flat, _ = adapter._validate_joint_features(source_joint, name="source_joint", rel_mass_tol=1e-6)
-    target_moments = target_flat.mean(dim=0)
-    init_weights = torch.ones(source_flat.size(0), dtype=source_flat.dtype) / float(source_flat.size(0))
-    init_moments = torch.sum(init_weights.view(-1, 1) * source_flat, dim=0)
-    init_error = float((init_moments - target_moments).abs().max().item())
-
-    weights, history = adapter.solve_iis(
-        source_layer_feats=source_feats,
-        source_class_probs=source_class_probs,
-        target_layer_feats=target_feats,
-        target_class_probs=target_class_probs,
-        max_iter=6,
-        iis_tol=0.0,
-        f_mass_rel_tol=1e-3,
-    )
-    final_error = history[-1].max_moment_error if history else float("inf")
-    assert float(weights.sum().item()) == pytest.approx(1.0, rel=0, abs=1e-12)
-    assert float(weights.min().item()) >= 0.0
-    assert final_error < init_error
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,9 @@
 """
-Shared clustering backend interface for ME-IIS.
+Shared latent-probability backend interface for ME-IIS.
+
+The backend is responsible only for producing P[M_i=j | a_i] for a given
+layer's activations a_i. IIS math (Eq. 14–18) consumes these probabilities
+without caring about the underlying model (GMM, vMF-softmax, etc.).
 """
 
 from abc import ABC, abstractmethod
@@ -7,8 +11,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 
-class ClusteringBackend(ABC):
-    """Abstract interface for per-layer clustering backends."""
+class LatentBackend(ABC):
+    """Abstract interface for per-layer latent probability backends."""
 
     @property
     @abstractmethod
@@ -22,3 +26,7 @@ class ClusteringBackend(ABC):
     @abstractmethod
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Return per-sample responsibilities with shape (N, n_components)."""
+
+
+# Backwards compatibility: previous code referred to this interface as ClusteringBackend.
+ClusteringBackend = LatentBackend

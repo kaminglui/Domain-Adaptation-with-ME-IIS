@@ -5,9 +5,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from clustering.base import ClusteringBackend
+from clustering.base import LatentBackend
 from clustering.factory import create_backend
-from utils.entropy import prediction_entropy, select_low_entropy_indices
+from models.iis_components import ConstraintIndexer, IISUpdater, JointConstraintBuilder, TargetEntropyFilter
 
 
 @dataclass
@@ -24,45 +24,6 @@ class IISIterationStats:
     feature_mass_max: float
     feature_mass_mean: float
     feature_mass_std: float
-
-
-class ConstraintIndexer:
-    """Utility to flatten (layer, component, class) constraint tensors."""
-
-    def __init__(self, layers: List[str], components_per_layer: Dict[str, int], num_classes: int):
-        self.layers = list(layers)
-        self.components_per_layer = components_per_layer
-        self.num_classes = num_classes
-        self.offsets: Dict[str, int] = {}
-        offset = 0
-        for layer in self.layers:
-            self.offsets[layer] = offset
-            offset += self.components_per_layer[layer] * num_classes
-        self.total_constraints = offset
-
-    def flatten(self, joint: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Flatten dict of joint features into shape (N, C_total)."""
-        flats = []
-        for layer in self.layers:
-            flats.append(joint[layer].reshape(joint[layer].shape[0], -1))
-        return torch.cat(flats, dim=1)
-
-    def decode(self, flat_idx: int) -> Tuple[str, int, int]:
-        """
-        Map a flattened constraint index back to (layer, component_idx, class_idx).
-        """
-        if flat_idx < 0 or flat_idx >= self.total_constraints:
-            raise ValueError(f"Flat index {flat_idx} out of range [0, {self.total_constraints}).")
-        for layer in self.layers:
-            start = self.offsets[layer]
-            width = self.components_per_layer[layer] * self.num_classes
-            end = start + width
-            if start <= flat_idx < end:
-                local = flat_idx - start
-                comp_idx = local // self.num_classes
-                class_idx = local % self.num_classes
-                return layer, int(comp_idx), int(class_idx)
-        raise RuntimeError(f"Failed to decode flat index {flat_idx}.")
 
 
 class MaxEntAdapter:
@@ -98,8 +59,6 @@ class MaxEntAdapter:
         self.layers = layers
         self.components_per_layer = dict(components_per_layer)
         self.device = device
-        self.indexer = ConstraintIndexer(layers, self.components_per_layer, num_classes)
-        self.expected_feature_mass = float(len(layers))
         self.seed = seed
         self.gmm_selection_mode = gmm_selection_mode
         self.gmm_bic_min_components = gmm_bic_min_components
@@ -108,11 +67,21 @@ class MaxEntAdapter:
         self.vmf_kappa = vmf_kappa
         self.cluster_clean_ratio = cluster_clean_ratio
         self.kmeans_n_init = kmeans_n_init
-        self.cluster_backends: Dict[str, ClusteringBackend] = {}
+        self.cluster_backends: Dict[str, LatentBackend] = {}
         self.selected_components_per_layer: Dict[str, int] = dict(self.components_per_layer)
         self.unachievable_constraints: List[int] = []
+        self.joint_builder = JointConstraintBuilder(
+            layers=self.layers,
+            components_per_layer=self.components_per_layer,
+            num_classes=self.num_classes,
+            device=self.device,
+            backends=self.cluster_backends,
+        )
+        self.indexer = self.joint_builder.indexer
+        self.expected_feature_mass = self.joint_builder.expected_feature_mass
+        self.iis_updater = IISUpdater(num_latent=len(self.layers), num_discrete=0)
 
-    def _build_backend_for_layer(self, layer: str, n_components: int) -> ClusteringBackend:
+    def _build_backend_for_layer(self, layer: str, n_components: int) -> LatentBackend:
         return create_backend(
             backend_name=self.cluster_backend,
             n_components=n_components,
@@ -127,7 +96,9 @@ class MaxEntAdapter:
 
     def _refresh_indexer(self) -> None:
         """Rebuild the constraint indexer after component count changes."""
-        self.indexer = ConstraintIndexer(self.layers, self.components_per_layer, self.num_classes)
+        self.joint_builder.update_components(self.components_per_layer)
+        self.indexer = self.joint_builder.indexer
+        self.expected_feature_mass = self.joint_builder.expected_feature_mass
 
     def get_components_per_layer(self) -> Dict[str, int]:
         """Return a copy of the per-layer component counts after fitting."""
@@ -163,18 +134,8 @@ class MaxEntAdapter:
         rel_mass_tol: float,
         expected_mass: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        flat, feature_mass = self.joint_builder.validate_and_flatten(joint, rel_mass_tol=rel_mass_tol)
         expected = self.expected_feature_mass if expected_mass is None else float(expected_mass)
-        for layer in self.layers:
-            if layer not in joint:
-                raise ValueError(f"{name} missing layer '{layer}'.")
-            tensor = joint[layer]
-            if tensor.dim() != 3 or tensor.shape[2] != self.num_classes:
-                raise ValueError(
-                    f"{name}[{layer}] must have shape (N, J_l, K) with K={self.num_classes}. Got {tuple(tensor.shape)}."
-                )
-            self._assert_non_negative(tensor, f"{name}[{layer}]")
-        flat = self.indexer.flatten(joint).to(self.device)
-        feature_mass = flat.sum(dim=1)
         eps = 1e-8
         max_dev = float((feature_mass - expected).abs().max().item())
         rel_dev = max_dev / (abs(expected) + eps)
@@ -183,7 +144,7 @@ class MaxEntAdapter:
                 f"{name} feature mass deviates from expected ~{expected:.6f} "
                 f"(max_abs_dev={max_dev:.4e}, rel_dev={rel_dev:.3e}, tol={rel_mass_tol:.3e})."
             )
-        return flat, feature_mass
+        return flat.to(self.device), feature_mass.to(self.device)
 
     def decode_constraint(self, flat_idx: int) -> Tuple[str, int, int]:
         """Expose index decoding for logging and tests."""
@@ -207,13 +168,14 @@ class MaxEntAdapter:
         if self.cluster_clean_ratio < 1.0:
             if target_class_probs is None:
                 raise ValueError("target_class_probs are required when cluster_clean_ratio < 1.0.")
-            probs_np = target_class_probs.detach().cpu().numpy()
-            if probs_np.shape[0] != n_samples:
+            if target_class_probs.shape[0] != n_samples:
                 raise ValueError("target_class_probs must align with target_layer_features.")
-            ent = prediction_entropy(probs_np)
-            clean_indices = select_low_entropy_indices(ent, keep_ratio=self.cluster_clean_ratio)
+            entropy_filter = TargetEntropyFilter(keep_ratio=self.cluster_clean_ratio)
+            clean_indices = entropy_filter.select(target_class_probs)
+            if clean_indices is None:
+                clean_indices = np.arange(n_samples)
             print(
-                f"[Cluster] Using {len(clean_indices)}/{probs_np.shape[0]} low-entropy target samples "
+                f"[Cluster] Using {len(clean_indices)}/{n_samples} low-entropy target samples "
                 f"(keep_ratio={self.cluster_clean_ratio})."
             )
 
@@ -227,6 +189,7 @@ class MaxEntAdapter:
             self.components_per_layer[layer] = int(backend.n_components)
             self.selected_components_per_layer[layer] = int(backend.n_components)
 
+        self.joint_builder.set_backends(self.cluster_backends)
         self._refresh_indexer()
         comp_str = self.get_components_per_layer_str()
         print(
@@ -246,12 +209,7 @@ class MaxEntAdapter:
         self, layer_features: Dict[str, torch.Tensor], class_probs: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """Return joint features dict: layer -> (N, J_l, K)."""
-        joint: Dict[str, torch.Tensor] = {}
-        for layer in self.layers:
-            gamma = self._predict_gamma(layer, layer_features[layer])  # (N, J_l)
-            # Each entry is a fractional feature count P(component=j, class=k | x) as in Pal & Miller's probabilistic instances.
-            joint[layer] = gamma.unsqueeze(2) * class_probs.unsqueeze(1)
-        return joint
+        return self.joint_builder.build_joint(layer_features, class_probs)
 
     def _kl_div(self, p: torch.Tensor, q: torch.Tensor) -> float:
         p_safe = p + 1e-8
@@ -288,31 +246,34 @@ class MaxEntAdapter:
             verbose: if True, log per-iteration weight statistics for debugging.
         """
         device = self.device
-        # Compute target constraint moments
+        iis = self.iis_updater
+        # Compute target constraint moments (Eq. 14)
         if precomputed_target_joint is not None:
             target_joint = precomputed_target_joint
         else:
             if target_layer_feats is None or target_class_probs is None:
-                raise ValueError("target_layer_feats and target_class_probs are required when no precomputed target joint is provided.")
+                raise ValueError(
+                    "target_layer_feats and target_class_probs are required when no precomputed target joint is provided."
+                )
             target_joint = self.get_joint_features(target_layer_feats, target_class_probs)
-        target_flat, _ = self._validate_joint_features(
-            target_joint, name="target_joint", rel_mass_tol=f_mass_rel_tol
-        )
-        target_moments = target_flat.to(device).mean(dim=0)  # (C,)
+        target_flat, _ = self._validate_joint_features(target_joint, name="target_joint", rel_mass_tol=f_mass_rel_tol)
+        target_moments = iis.compute_pg(target_flat.to(device))  # (C,)
 
-        # Build source joint features (fractional features summed across layers)
+        # Build source joint features (Eq. 15 uses the same joint construction)
         if precomputed_source_joint is not None:
             source_joint = precomputed_source_joint
         else:
             if source_layer_feats is None or source_class_probs is None:
-                raise ValueError("source_layer_feats and source_class_probs are required when no precomputed source joint is provided.")
+                raise ValueError(
+                    "source_layer_feats and source_class_probs are required when no precomputed source joint is provided."
+                )
             source_joint = self.get_joint_features(source_layer_feats, source_class_probs)
         source_flat, feature_mass = self._validate_joint_features(
             source_joint, name="source_joint", rel_mass_tol=f_mass_rel_tol
         )
         source_flat = source_flat.to(device)  # (N_s, C)
         source_sum = source_flat.sum(dim=0)
-        unreachable_mask = (source_sum == 0) & (target_moments > 0)
+        unreachable_mask = (source_sum <= 0) & (target_moments > 0)
         self.unachievable_constraints = []
         if bool(unreachable_mask.any()):
             unreachable_indices = torch.nonzero(unreachable_mask, as_tuple=False).view(-1).tolist()
@@ -327,15 +288,12 @@ class MaxEntAdapter:
                 self.unachievable_constraints.append(int(flat_idx))
 
         N_s = source_flat.size(0)
-        weights = torch.ones(N_s, device=device) / float(N_s)
-        lambdas = torch.zeros(self.indexer.total_constraints, device=device)
+        weights = torch.full((N_s,), 1.0 / float(N_s), dtype=source_flat.dtype, device=device)
+        self._assert_valid_distribution(weights, name="IIS initial weights")
         f_mass_mean = float(feature_mass.mean().item())
         f_mass_std = float(feature_mass.std().item())
-        mass_constant = f_mass_mean
         eps = 1e-8
-        if abs(f_mass_mean) < eps:
-            raise RuntimeError("Feature mass mean is zero; cannot apply fractional IIS update.")
-        rel_mass_std = f_mass_std / (f_mass_mean + eps)
+        rel_mass_std = f_mass_std / (abs(f_mass_mean) + eps)
         if rel_mass_std > f_mass_rel_tol:
             print(
                 f"[IIS][WARNING] Feature mass not approximately constant: mean={f_mass_mean:.6f}, "
@@ -347,33 +305,17 @@ class MaxEntAdapter:
                 f"[IIS] Feature mass check ok: mean={f_mass_mean:.6f}, std={f_mass_std:.6f}, "
                 f"rel_std={rel_mass_std:.3e}"
             )
+        print(f"[IIS] Using Eq.18 denominator Nd+Nc={iis.mass_constant:.6f} (Nc={len(self.layers)}, Nd=0)")
 
         history: List[IISIterationStats] = []
         converged = False
         for it in range(max_iter):
-            current_moments = torch.sum(weights.view(-1, 1) * source_flat, dim=0)  # (C,)
-            ratio = torch.ones_like(current_moments)
-            active_mask = (target_moments > eps) | (current_moments > eps)
-            ratio[active_mask] = (target_moments[active_mask] + eps) / (current_moments[active_mask] + eps)
-            ratio = torch.clamp(ratio, min=1e-6, max=1e6)
-            delta_update = torch.zeros_like(current_moments)
-            # Pal & Miller Eq. (12): Δλ = (1 / Nd) · log(P_g / P_m), with mass_constant acting as Nd for fractional features.
-            delta_update[active_mask] = torch.log(ratio[active_mask]) / (mass_constant + eps)
-            lambdas = lambdas + delta_update
-
-            # Update weights using new lambdas
-            exponent = torch.sum(source_flat * delta_update.unsqueeze(0), dim=1)
-            weights = weights * torch.exp(exponent)
-            if torch.any(weights < -1e-9):
-                print("[IIS][WARNING] Negative weights encountered; clamping to 0 before renormalization.")
-            weights = torch.clamp(weights, min=0.0)
-            weight_sum = weights.sum()
-            if weight_sum.item() <= eps:
-                raise RuntimeError("Weights collapsed to zero mass during IIS update.")
-            weights = weights / weight_sum
+            step_result = iis.step(weights, source_flat, target_moments)
+            delta_update = step_result.delta
+            weights = step_result.updated_weights
             self._assert_valid_distribution(weights, name="IIS weights")
 
-            updated_moments = torch.sum(weights.view(-1, 1) * source_flat, dim=0)
+            updated_moments = iis.compute_pm(weights, source_flat)
             moment_error = updated_moments - target_moments
             max_abs_error = float(moment_error.abs().max().detach().cpu().item())
             l2_error = float(moment_error.pow(2).sum().sqrt().detach().cpu().item())
