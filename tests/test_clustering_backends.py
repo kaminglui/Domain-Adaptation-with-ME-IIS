@@ -72,14 +72,10 @@ def test_target_moments_are_mean_of_joint_features() -> None:
     adapter = MaxEntAdapter(
         num_classes=2, layers=["layer"], components_per_layer={"layer": 2}, device=torch.device("cpu")
     )
-    joint_tensor = torch.tensor(
-        [
-            [[0.6, 0.4], [0.2, 0.8]],
-            [[0.3, 0.7], [0.5, 0.5]],
-        ],
-        dtype=torch.float64,
-    )
-    joint = {"layer": joint_tensor}
+    gamma = torch.tensor([[0.6, 0.4], [0.3, 0.7]], dtype=torch.float64)
+    class_probs = torch.tensor([[0.5, 0.5], [0.25, 0.75]], dtype=torch.float64)
+    joint_tensor = gamma.unsqueeze(2) * class_probs.unsqueeze(1)
+    joint = {"layer": joint_tensor.clone()}
     flat, _ = adapter._validate_joint_features(joint, name="joint", rel_mass_tol=1e-10)
     expected = joint_tensor.reshape(joint_tensor.shape[0], -1).mean(dim=0)
     assert torch.allclose(flat.mean(dim=0), expected, atol=1e-12)
