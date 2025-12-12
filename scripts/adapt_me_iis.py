@@ -22,6 +22,7 @@ from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_R
 from eval import evaluate
 from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
+from src.cli.args import AdaptConfig, build_adapt_parser, dump_config
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.feature_utils import extract_features
@@ -802,158 +803,11 @@ def adapt_me_iis(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ME-IIS domain adaptation on Office-Home or Office-31.")
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default="office_home",
-        choices=["office_home", "office31"],
-        help="Which benchmark to use (Office-Home or Office-31).",
-    )
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default=None,
-        help=(
-            f"Path to dataset root (defaults: Office-Home -> {DEFAULT_OFFICE_HOME_ROOT}, "
-            f"Office-31 -> {DEFAULT_OFFICE31_ROOT})."
-        ),
-    )
-    parser.add_argument("--source_domain", type=str, required=True)
-    parser.add_argument("--target_domain", type=str, required=True)
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to source-only checkpoint.")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--num_latent_styles", type=int, default=5)
-    parser.add_argument(
-        "--components_per_layer",
-        type=str,
-        default=None,
-        help="Optional comma-separated overrides 'layer:count,...' for per-layer mixture components.",
-    )
-    parser.add_argument(
-        "--gmm_selection_mode",
-        type=str,
-        default="fixed",
-        choices=["fixed", "bic"],
-        help="How to choose the number of GMM components per layer for ME-IIS.",
-    )
-    parser.add_argument(
-        "--gmm_bic_min_components",
-        type=int,
-        default=2,
-        help="Minimum number of mixture components per layer when using BIC selection.",
-    )
-    parser.add_argument(
-        "--gmm_bic_max_components",
-        type=int,
-        default=8,
-        help="Maximum number of mixture components per layer when using BIC selection.",
-    )
-    parser.add_argument(
-        "--cluster_backend",
-        type=str,
-        default="gmm",
-        choices=["gmm", "vmf_softmax"],
-        help="Clustering backend to model latent styles in ME-IIS.",
-    )
-    parser.add_argument(
-        "--vmf_kappa",
-        type=float,
-        default=20.0,
-        help="Concentration parameter kappa for vmf_softmax backend.",
-    )
-    parser.add_argument(
-        "--cluster_clean_ratio",
-        type=float,
-        default=1.0,
-        help="Keep-ratio for lowest-entropy target samples when fitting clustering.",
-    )
-    parser.add_argument(
-        "--kmeans_n_init",
-        type=int,
-        default=10,
-        help="Number of KMeans initializations for vmf_softmax backend.",
-    )
-    parser.add_argument(
-        "--feature_layers",
-        type=str,
-        default="layer3,layer4",
-        help="Comma-separated ResNet-50 layers to include in ME-IIS constraints.",
-    )
-    parser.add_argument(
-        "--source_prob_mode",
-        type=str,
-        default="softmax",
-        choices=["softmax", "onehot"],
-        help="How to form P(Ĉ|x) on source for constraints. Default uses model softmax (spec), "
-        "onehot uses ground-truth labels for stability.",
-    )
-    parser.add_argument("--iis_iters", type=int, default=15)
-    parser.add_argument("--iis_tol", type=float, default=1e-3, help="Tolerance for IIS max abs moment error.")
-    parser.add_argument("--adapt_epochs", type=int, default=10)
-    parser.add_argument(
-        "--resume_adapt_from",
-        type=str,
-        default=None,
-        help="Optional ME-IIS adaptation checkpoint to resume from.",
-    )
-    parser.add_argument(
-        "--save_adapt_every",
-        type=int,
-        default=0,
-        help="If >0, save ME-IIS adaptation checkpoint every N epochs.",
-    )
-    parser.add_argument(
-        "--finetune_backbone", action="store_true", help="Fine-tune backbone during adaptation (otherwise frozen)."
-    )
-    parser.add_argument(
-        "--backbone_lr_scale",
-        type=float,
-        default=0.1,
-        help="Backbone LR is classifier_lr * backbone_lr_scale when finetuning.",
-    )
-    parser.add_argument("--classifier_lr", type=float, default=1e-2)
-    parser.add_argument("--weight_decay", type=float, default=1e-3)
-    parser.add_argument(
-        "--use_pseudo_labels",
-        action="store_true",
-        help="If set, include high-confidence pseudo-labelled target samples during ME-IIS adaptation.",
-    )
-    parser.add_argument(
-        "--pseudo_conf_thresh",
-        type=float,
-        default=0.9,
-        help="Confidence threshold for creating pseudo labels on target (max softmax >= this).",
-    )
-    parser.add_argument(
-        "--pseudo_max_ratio",
-        type=float,
-        default=1.0,
-        help="Max size of pseudo-labelled target set as a ratio of the source sample count.",
-    )
-    parser.add_argument(
-        "--pseudo_loss_weight",
-        type=float,
-        default=1.0,
-        help="Multiplicative weight for the pseudo-labelled target loss term.",
-    )
-    parser.add_argument("--dry_run_max_samples", type=int, default=0, help="Limit samples for quick dry-runs.")
-    parser.add_argument(
-        "--dry_run_max_batches",
-        type=int,
-        default=0,
-        help="If >0, limit both feature extraction and adaptation training to this many batches per phase.",
-    )
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Force deterministic/cuDNN safe settings (pair with --seed for reproducibility).",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return build_adapt_parser().parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    adapt_me_iis(args)
+    cfg = AdaptConfig(**vars(args))
+    dump_config(cfg, cfg.dump_config)
+    adapt_me_iis(cfg)

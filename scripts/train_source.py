@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from datasets.domain_loaders import DEFAULT_OFFICE31_ROOT, DEFAULT_OFFICE_HOME_ROOT, get_domain_loaders
 from eval import evaluate
 from models.classifier import build_model
+from src.cli.args import TrainConfig, build_train_parser, dump_config
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
 from utils.env_utils import is_colab
@@ -412,75 +413,11 @@ def train_source(args) -> None:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Source-only training for Office-Home or Office-31.")
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default="office_home",
-        choices=["office_home", "office31"],
-        help="Which benchmark to use (Office-Home or Office-31).",
-    )
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default=None,
-        help=(
-            f"Path to dataset root (defaults: Office-Home -> {DEFAULT_OFFICE_HOME_ROOT}, "
-            f"Office-31 -> {DEFAULT_OFFICE31_ROOT})."
-        ),
-    )
-    parser.add_argument("--source_domain", type=str, required=True, help="Source domain e.g., Ar.")
-    parser.add_argument("--target_domain", type=str, required=True, help="Target domain e.g., Cl.")
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument(
-        "--resume_from",
-        type=str,
-        default=None,
-        help="Optional path to a source-only checkpoint to resume training from.",
-    )
-    parser.add_argument(
-        "--save_every",
-        type=int,
-        default=0,
-        help="If >0, save an intermediate checkpoint every N epochs (in addition to the final one).",
-    )
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr_backbone", type=float, default=1e-3)
-    parser.add_argument("--lr_classifier", type=float, default=1e-2)
-    parser.add_argument("--weight_decay", type=float, default=1e-3)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Force deterministic/cuDNN safe settings (pair with --seed for reproducibility).",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--dry_run_max_batches",
-        type=int,
-        default=0,
-        help="If >0, limit training to this many batches total (for quick sanity checks).",
-    )
-    parser.add_argument(
-        "--dry_run_max_samples",
-        type=int,
-        default=0,
-        help="If >0, limit the number of samples per domain (for very fast dry-runs).",
-    )
-    parser.add_argument(
-        "--eval_on_source_self",
-        action="store_true",
-        help="If set, evaluate the source-only checkpoint on the source domain (e.g., Art→Art).",
-    )
-    parser.add_argument(
-        "--eval_results_csv",
-        type=str,
-        default=str(Path("results") / "office_home_me_iis.csv"),
-        help="Optional CSV path to append the source-self accuracy when --eval_on_source_self is used.",
-    )
-    return parser.parse_args()
+    return build_train_parser().parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_source(args)
+    cfg = TrainConfig(**vars(args))
+    dump_config(cfg, cfg.dump_config)
+    train_source(cfg)

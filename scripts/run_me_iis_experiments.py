@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
+from src.cli.args import ExperimentConfig, build_experiments_parser, dump_config
 from utils.experiment_utils import (
     build_components_map,
     build_source_ckpt_path,
@@ -444,78 +445,27 @@ def run_exp_me_iis(args: argparse.Namespace, seeds: List[int]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run ME–IIS ablation suites.")
-    parser.add_argument("--dataset_name", type=str, default="office_home", choices=["office_home", "office31"])
-    parser.add_argument("--source_domain", type=str, required=True)
-    parser.add_argument("--target_domain", type=str, required=True)
-    parser.add_argument("--seeds", type=str, default="0", help='Comma-separated seeds, e.g., "0,1,2".')
-    parser.add_argument("--experiment_family", type=str, required=True, choices=["layers", "gmm", "me_iis"])
-    parser.add_argument(
-        "--output_csv",
-        type=str,
-        default=str(Path("results") / "me_iis_experiments_summary.csv"),
-        help="Where to write compact experiment summaries.",
-    )
-    parser.add_argument(
-        "--base_data_root",
-        type=str,
-        default=None,
-        help="Optional override for dataset root (otherwise reuse defaults in loaders).",
-    )
-    parser.add_argument("--num_epochs", type=int, default=50, help="Source-only epochs (matches train_source default).")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--lr_backbone", type=float, default=1e-3)
-    parser.add_argument("--lr_classifier", type=float, default=1e-2)
-    parser.add_argument("--weight_decay", type=float, default=1e-3)
-    parser.add_argument("--num_latent_styles", type=int, default=5, help="Default components per layer when fixed.")
-    parser.add_argument("--components_per_layer", type=str, default=None, help="Optional comma-separated override.")
-    parser.add_argument(
-        "--gmm_selection_mode",
-        type=str,
-        default="fixed",
-        choices=["fixed", "bic"],
-        help="How to choose GMM components when adapting.",
-    )
-    parser.add_argument("--gmm_bic_min_components", type=int, default=2)
-    parser.add_argument("--gmm_bic_max_components", type=int, default=15)
-    parser.add_argument("--cluster_backend", type=str, default="gmm", choices=["gmm", "vmf_softmax"])
-    parser.add_argument("--vmf_kappa", type=float, default=20.0)
-    parser.add_argument("--cluster_clean_ratio", type=float, default=1.0)
-    parser.add_argument("--kmeans_n_init", type=int, default=10)
-    parser.add_argument("--feature_layers", type=str, default="layer3,layer4")
-    parser.add_argument("--source_prob_mode", type=str, default="softmax", choices=["softmax", "onehot"])
-    parser.add_argument("--iis_iters", type=int, default=15)
-    parser.add_argument("--iis_tol", type=float, default=1e-3)
-    parser.add_argument("--adapt_epochs", type=int, default=10)
-    parser.add_argument("--finetune_backbone", action="store_true")
-    parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
-    parser.add_argument("--classifier_lr", type=float, default=1e-2)
-    parser.add_argument("--pseudo_conf_thresh", type=float, default=0.9)
-    parser.add_argument("--pseudo_max_ratio", type=float, default=0.3)
-    parser.add_argument("--pseudo_loss_weight", type=float, default=0.5)
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--dry_run_max_samples", type=int, default=0)
-    parser.add_argument("--dry_run_max_batches", type=int, default=0)
-    return parser.parse_args()
+    return build_experiments_parser().parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    seeds = parse_seeds(args.seeds)
+    cfg = ExperimentConfig(**vars(args))
+    dump_config(cfg, cfg.dump_config)
+    seeds = parse_seeds(cfg.seeds)
     print(
-        f"[Driver] Running family={args.experiment_family} seeds={seeds} "
-        f"dataset={args.dataset_name} {args.source_domain}->{args.target_domain}"
+        f"[Driver] Running family={cfg.experiment_family} seeds={seeds} "
+        f"dataset={cfg.dataset_name} {cfg.source_domain}->{cfg.target_domain}"
     )
-    if args.experiment_family == "layers":
-        run_exp_layers(args, seeds)
-    elif args.experiment_family == "gmm":
-        run_exp_gmm(args, seeds)
-    elif args.experiment_family == "me_iis":
-        run_exp_me_iis(args, seeds)
+    if cfg.experiment_family == "layers":
+        run_exp_layers(cfg, seeds)
+    elif cfg.experiment_family == "gmm":
+        run_exp_gmm(cfg, seeds)
+    elif cfg.experiment_family == "me_iis":
+        run_exp_me_iis(cfg, seeds)
     else:
-        raise ValueError(f"Unknown experiment_family {args.experiment_family}")
-    print(f"[Driver] Summary written to {args.output_csv}")
+        raise ValueError(f"Unknown experiment_family {cfg.experiment_family}")
+    print(f"[Driver] Summary written to {cfg.output_csv}")
 
 
 if __name__ == "__main__":
