@@ -39,6 +39,28 @@ class TestCLIInvalidArgs(unittest.TestCase):
         vmf = create_backend("vmf_softmax", n_components=3, seed=0, vmf_kappa=10.0)
         self.assertIsInstance(vmf, VMFSoftmaxBackend)
 
+    def test_adapt_parser_accepts_vmf_flags(self) -> None:
+        parser = build_adapt_parser()
+        args = parser.parse_args(
+            [
+                "--source_domain",
+                "Ar",
+                "--target_domain",
+                "Cl",
+                "--checkpoint",
+                "/tmp/x.pth",
+                "--cluster_backend",
+                "vmf_softmax",
+                "--vmf_kappa",
+                "25",
+                "--cluster_clean_ratio",
+                "0.8",
+            ]
+        )
+        self.assertEqual(args.cluster_backend, "vmf_softmax")
+        self.assertAlmostEqual(args.vmf_kappa, 25.0)
+        self.assertAlmostEqual(args.cluster_clean_ratio, 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

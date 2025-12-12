@@ -139,3 +139,10 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
 ## CLI Reference
 - Auto-generated parser details live in [docs/cli_reference.md](docs/cli_reference.md). Regenerate after changing flags:  
   `python scripts/generate_cli_reference.py --out docs/cli_reference.md`
+
+## Colab Experiments
+- Notebook: `ME_IIS_Colab.ipynb`
+  - Includes source-only, ME-IIS GMM, and new `vmf_softmax` experiments plus sweeps (kappa/K/entropy filtering) and layer-placement ablations.
+  - Sections cover setup, data configuration, debugging checks (PMF/joint mass/IIS diagnostics), and recommended next-step sweeps.
+  - Switch to vMF runs by setting `--cluster_backend vmf_softmax` (with `--vmf_kappa`, `--cluster_clean_ratio`, `--kmeans_n_init`) in the config cell.
+- Uses the same CLI flags as the scripts; see [docs/cli_reference.md](docs/cli_reference.md) for flag details.
