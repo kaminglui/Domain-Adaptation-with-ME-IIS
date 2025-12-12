@@ -4,7 +4,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from sklearn.mixture import GaussianMixture
+
+from clustering.base import ClusteringBackend
+from clustering.factory import create_backend
+from utils.entropy import prediction_entropy, select_low_entropy_indices
 
 
 @dataclass
@@ -66,7 +69,7 @@ class MaxEntAdapter:
     """
     Maximum Entropy IIS adapter using the Pal & Miller fractional IIS extension.
 
-    We build *fractional* feature counts by multiplying GMM responsibilities with
+    We build *fractional* feature counts by multiplying clustering responsibilities with
     class posteriors on target features, yielding probabilistic instances per
     (mixture-component, class) constraint. Improved Iterative Scaling then finds
     a maximum entropy distribution over source samples whose expected fractional
@@ -86,6 +89,10 @@ class MaxEntAdapter:
         gmm_selection_mode: str = "fixed",
         gmm_bic_min_components: int = 2,
         gmm_bic_max_components: int = 8,
+        cluster_backend: str = "gmm",
+        vmf_kappa: float = 20.0,
+        cluster_clean_ratio: float = 1.0,
+        kmeans_n_init: int = 10,
     ):
         self.num_classes = num_classes
         self.layers = layers
@@ -97,20 +104,26 @@ class MaxEntAdapter:
         self.gmm_selection_mode = gmm_selection_mode
         self.gmm_bic_min_components = gmm_bic_min_components
         self.gmm_bic_max_components = gmm_bic_max_components
-        self.gmms: Dict[str, GaussianMixture] = self._build_layer_gmms()
+        self.cluster_backend = cluster_backend
+        self.vmf_kappa = vmf_kappa
+        self.cluster_clean_ratio = cluster_clean_ratio
+        self.kmeans_n_init = kmeans_n_init
+        self.cluster_backends: Dict[str, ClusteringBackend] = {}
         self.selected_components_per_layer: Dict[str, int] = dict(self.components_per_layer)
         self.unachievable_constraints: List[int] = []
 
-    def _build_layer_gmms(self) -> Dict[str, GaussianMixture]:
-        return {
-            layer: GaussianMixture(
-                n_components=self.components_per_layer[layer],
-                covariance_type="diag",
-                reg_covar=1e-6,
-                random_state=self.seed,
-            )
-            for layer in self.layers
-        }
+    def _build_backend_for_layer(self, layer: str, n_components: int) -> ClusteringBackend:
+        return create_backend(
+            backend_name=self.cluster_backend,
+            n_components=n_components,
+            seed=self.seed,
+            layer_name=layer,
+            gmm_selection_mode=self.gmm_selection_mode,
+            gmm_bic_min_components=self.gmm_bic_min_components,
+            gmm_bic_max_components=self.gmm_bic_max_components,
+            kmeans_n_init=self.kmeans_n_init,
+            vmf_kappa=self.vmf_kappa,
+        )
 
     def _refresh_indexer(self) -> None:
         """Rebuild the constraint indexer after component count changes."""
@@ -127,64 +140,6 @@ class MaxEntAdapter:
         """
         order = layers if layers is not None else self.layers
         return ",".join(str(self.components_per_layer.get(layer, 0)) for layer in order)
-
-    def _select_components_via_bic(
-        self,
-        layer_name: str,
-        feats_np: np.ndarray,
-        min_components: int,
-        max_components: int,
-    ) -> GaussianMixture:
-        """Fit several GMMs and pick the component count with the lowest BIC."""
-        if feats_np.ndim != 2:
-            raise ValueError(f"Expected 2D features for BIC selection, got shape {feats_np.shape}.")
-        n_samples = feats_np.shape[0]
-        if n_samples == 0:
-            raise ValueError("Cannot run BIC selection with zero target samples.")
-        max_subsample = 20000
-        if n_samples > max_subsample:
-            rng = np.random.default_rng(self.seed)
-            idx = rng.choice(n_samples, size=max_subsample, replace=False)
-            feats_np_sub = feats_np[idx]
-        else:
-            feats_np_sub = feats_np
-
-        min_comp = max(1, int(min_components))
-        max_comp = max(min_comp, int(max_components))
-        max_comp = min(max_comp, feats_np_sub.shape[0])
-        min_comp = min(min_comp, max_comp)
-
-        best_bic = np.inf
-        best_m = None
-        for m in range(min_comp, max_comp + 1):
-            if m > feats_np_sub.shape[0]:
-                continue
-            gmm = GaussianMixture(
-                n_components=m,
-                covariance_type="diag",
-                reg_covar=1e-6,
-                random_state=self.seed,
-            )
-            gmm.fit(feats_np_sub)
-            bic = gmm.bic(feats_np_sub)
-            if bic < best_bic:
-                best_bic = bic
-                best_m = m
-
-        if best_m is None:
-            raise RuntimeError(
-                f"BIC component selection failed for layer '{layer_name}' with min={min_components}, max={max_components}."
-            )
-
-        final_gmm = GaussianMixture(
-            n_components=best_m,
-            covariance_type="diag",
-            reg_covar=1e-6,
-            random_state=self.seed,
-        )
-        final_gmm.fit(feats_np)
-        print(f"[GMM] layer={layer_name} selection=bic M*={best_m} BIC={best_bic:.3e}")
-        return final_gmm
 
     def _assert_non_negative(self, tensor: torch.Tensor, name: str, atol: float = 1e-8) -> None:
         min_val = float(tensor.min().item())
@@ -234,47 +189,57 @@ class MaxEntAdapter:
         """Expose index decoding for logging and tests."""
         return self.indexer.decode(flat_idx)
 
-    def fit_target_structure(self, target_layer_features: Dict[str, torch.Tensor]) -> None:
-        """Fit one GMM per layer on target activations."""
-        if self.gmm_selection_mode not in {"fixed", "bic"}:
+    def fit_target_structure(
+        self,
+        target_layer_features: Dict[str, torch.Tensor],
+        target_class_probs: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fit one clustering backend per layer on target activations."""
+        if self.cluster_backend == "gmm" and self.gmm_selection_mode not in {"fixed", "bic"}:
             raise ValueError(f"Unknown gmm_selection_mode '{self.gmm_selection_mode}'.")
+
+        sample_counts = {layer: int(target_layer_features[layer].shape[0]) for layer in self.layers}
+        if len(set(sample_counts.values())) > 1:
+            raise ValueError("All target layers must have the same number of samples for clustering fit.")
+        n_samples = next(iter(sample_counts.values()))
+
+        clean_indices = None
+        if self.cluster_clean_ratio < 1.0:
+            if target_class_probs is None:
+                raise ValueError("target_class_probs are required when cluster_clean_ratio < 1.0.")
+            probs_np = target_class_probs.detach().cpu().numpy()
+            if probs_np.shape[0] != n_samples:
+                raise ValueError("target_class_probs must align with target_layer_features.")
+            ent = prediction_entropy(probs_np)
+            clean_indices = select_low_entropy_indices(ent, keep_ratio=self.cluster_clean_ratio)
+            print(
+                f"[Cluster] Using {len(clean_indices)}/{probs_np.shape[0]} low-entropy target samples "
+                f"(keep_ratio={self.cluster_clean_ratio})."
+            )
 
         for layer in self.layers:
             feats_np = target_layer_features[layer].detach().cpu().numpy()
-            if self.gmm_selection_mode == "fixed":
-                gmm = self.gmms.get(layer)
-                if gmm is None or gmm.n_components != self.components_per_layer[layer]:
-                    gmm = GaussianMixture(
-                        n_components=self.components_per_layer[layer],
-                        covariance_type="diag",
-                        reg_covar=1e-6,
-                        random_state=self.seed,
-                    )
-                gmm.fit(feats_np)
-            elif self.gmm_selection_mode == "bic":
-                gmm = self._select_components_via_bic(
-                    layer_name=layer,
-                    feats_np=feats_np,
-                    min_components=self.gmm_bic_min_components,
-                    max_components=self.gmm_bic_max_components,
-                )
-            else:
-                raise ValueError(f"Unknown gmm_selection_mode '{self.gmm_selection_mode}'.")
-
-            self.gmms[layer] = gmm
-            self.components_per_layer[layer] = int(gmm.n_components)
-            self.selected_components_per_layer[layer] = int(gmm.n_components)
+            if clean_indices is not None:
+                feats_np = feats_np[clean_indices]
+            backend = self._build_backend_for_layer(layer, self.components_per_layer[layer])
+            backend.fit(feats_np)
+            self.cluster_backends[layer] = backend
+            self.components_per_layer[layer] = int(backend.n_components)
+            self.selected_components_per_layer[layer] = int(backend.n_components)
 
         self._refresh_indexer()
         comp_str = self.get_components_per_layer_str()
         print(
-            f"[GMM] selection_mode={self.gmm_selection_mode} | components_per_layer={comp_str} "
+            f"[Cluster] backend={self.cluster_backend} selection_mode={self.gmm_selection_mode} | components_per_layer={comp_str} "
             f"(layers order: {','.join(self.layers)})"
         )
 
     def _predict_gamma(self, layer: str, features: torch.Tensor) -> torch.Tensor:
+        backend = self.cluster_backends.get(layer)
+        if backend is None:
+            raise RuntimeError(f"Clustering backend for layer '{layer}' has not been fit.")
         feats_np = features.detach().cpu().numpy()
-        gamma = self.gmms[layer].predict_proba(feats_np)
+        gamma = backend.predict_proba(feats_np)
         return torch.from_numpy(gamma).to(self.device)
 
     def get_joint_features(

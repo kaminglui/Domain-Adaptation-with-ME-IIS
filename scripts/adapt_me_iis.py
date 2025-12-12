@@ -416,8 +416,10 @@ def adapt_me_iis(args) -> None:
         f"finetune_backbone={args.finetune_backbone} backbone_lr_scale={args.backbone_lr_scale} "
         f"classifier_lr={args.classifier_lr} source_prob_mode={args.source_prob_mode} "
         f"iis_iters={args.iis_iters} iis_tol={args.iis_tol} "
-        f"gmm_selection_mode={args.gmm_selection_mode} bic_range=[{args.gmm_bic_min_components},"
-        f"{args.gmm_bic_max_components}] "
+        f"cluster_backend={args.cluster_backend} gmm_selection_mode={args.gmm_selection_mode} "
+        f"bic_range=[{args.gmm_bic_min_components},{args.gmm_bic_max_components}] "
+        f"vmf_kappa={args.vmf_kappa} kmeans_n_init={args.kmeans_n_init} "
+        f"cluster_clean_ratio={args.cluster_clean_ratio} "
         f"dry_run_max_samples={args.dry_run_max_samples} dry_run_max_batches={args.dry_run_max_batches}"
     )
     print(
@@ -549,8 +551,12 @@ def adapt_me_iis(args) -> None:
         gmm_selection_mode=args.gmm_selection_mode,
         gmm_bic_min_components=args.gmm_bic_min_components,
         gmm_bic_max_components=args.gmm_bic_max_components,
+        cluster_backend=args.cluster_backend,
+        vmf_kappa=args.vmf_kappa,
+        cluster_clean_ratio=args.cluster_clean_ratio,
+        kmeans_n_init=args.kmeans_n_init,
     )
-    adapter.fit_target_structure({k: v.to(device) for k, v in target_feats.items()})
+    adapter.fit_target_structure({k: v.to(device) for k, v in target_feats.items()}, target_class_probs=target_probs)
     components_map = dict(adapter.components_per_layer)
     components_str = ",".join([str(components_map[layer]) for layer in feature_layers])
     total_components = sum(components_map.values())
@@ -843,6 +849,31 @@ def parse_args():
         type=int,
         default=8,
         help="Maximum number of mixture components per layer when using BIC selection.",
+    )
+    parser.add_argument(
+        "--cluster_backend",
+        type=str,
+        default="gmm",
+        choices=["gmm", "vmf_softmax"],
+        help="Clustering backend to model latent styles in ME-IIS.",
+    )
+    parser.add_argument(
+        "--vmf_kappa",
+        type=float,
+        default=20.0,
+        help="Concentration parameter kappa for vmf_softmax backend.",
+    )
+    parser.add_argument(
+        "--cluster_clean_ratio",
+        type=float,
+        default=1.0,
+        help="Keep-ratio for lowest-entropy target samples when fitting clustering.",
+    )
+    parser.add_argument(
+        "--kmeans_n_init",
+        type=int,
+        default=10,
+        help="Number of KMeans initializations for vmf_softmax backend.",
     )
     parser.add_argument(
         "--feature_layers",

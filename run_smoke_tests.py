@@ -56,6 +56,10 @@ class SmokeConfig:
     pseudo_conf_thresh: float = 0.9
     pseudo_max_ratio: float = 1.0
     pseudo_loss_weight: float = 1.0
+    cluster_backend: str = "gmm"
+    vmf_kappa: float = 20.0
+    cluster_clean_ratio: float = 1.0
+    kmeans_n_init: int = 10
 
     def source_args(self, data_root: Path) -> argparse.Namespace:
         return argparse.Namespace(
@@ -91,6 +95,10 @@ class SmokeConfig:
             gmm_selection_mode=self.gmm_selection_mode,
             gmm_bic_min_components=self.gmm_bic_min_components,
             gmm_bic_max_components=self.gmm_bic_max_components,
+            cluster_backend=self.cluster_backend,
+            vmf_kappa=self.vmf_kappa,
+            cluster_clean_ratio=self.cluster_clean_ratio,
+            kmeans_n_init=self.kmeans_n_init,
             feature_layers=self.feature_layers,
             source_prob_mode=self.source_prob_mode,
             iis_iters=self.iis_iters,

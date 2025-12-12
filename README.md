@@ -1,12 +1,12 @@
-# ME‑IIS Domain Adaptation
+# ME-IIS Domain Adaptation
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb)
 
 ## Overview
-ME‑IIS implements max-entropy importance sampling for unsupervised domain adaptation on Office-Home and Office-31. It trains a ResNet-50 source classifier, reweights source samples via IIS using style×class constraints, and optionally fine-tunes with pseudo-labels. A Colab notebook and an experiment driver provide end-to-end pipelines, including source-only health checks.
+ME-IIS implements max-entropy importance sampling for unsupervised domain adaptation on Office-Home and Office-31. It trains a ResNet-50 source classifier, reweights source samples via IIS using style x class constraints, and optionally fine-tunes with pseudo-labels. A Colab notebook and an experiment driver provide end-to-end pipelines, including source-only health checks.
 
 ## Key Features
 - Source-only training and source-self evaluation with automatic dataset resolution.
-- ME–IIS adaptation with GMM-based style clustering, deterministic seeds, and resumable checkpoints.
+- ME-IIS adaptation with pluggable style clustering (GMM by default, vMF-softmax prototypes optional), deterministic seeds, and resumable checkpoints.
 - Optional warm-start pseudo-labeling via two-stage runs in the Colab.
 - Experiment driver for layer/GMM ablations with CSV logging.
 - Smoke tests and IIS sanity checks for quick regression detection.
@@ -34,7 +34,7 @@ ME‑IIS implements max-entropy importance sampling for unsupervised domain adap
 ## Quickstart / Getting Started
 Open the two-stage pseudo-label notebook directly in Colab: [ME_IIS_Colab.ipynb](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb).
 
-Train source model (Ar→Cl):
+Train source model (Ar->Cl):
 ```bash
 python scripts/train_source.py --dataset_name office_home \
   --data_root datasets/Office-Home --source_domain Ar --target_domain Cl --num_epochs 50
@@ -45,11 +45,18 @@ python scripts/eval_source_only.py --dataset_name office_home \
   --data_root datasets/Office-Home --domain Ar \
   --checkpoint checkpoints/source_only_Ar_to_Cl_seed0.pth --append_results
 ```
-Adapt with ME–IIS:
+Adapt with ME-IIS (GMM backend):
 ```bash
 python scripts/adapt_me_iis.py --dataset_name office_home --data_root datasets/Office-Home \
   --source_domain Ar --target_domain Cl --checkpoint checkpoints/source_only_Ar_to_Cl_seed0.pth \
   --feature_layers "layer3,layer4" --gmm_selection_mode bic --adapt_epochs 10
+```
+Use the vMF-softmax prototype backend instead of GMM (ME-IIS logic unchanged):
+```bash
+python scripts/adapt_me_iis.py --dataset_name office_home --data_root datasets/Office-Home \
+  --source_domain Ar --target_domain Cl --checkpoint checkpoints/source_only_Ar_to_Cl_seed0.pth \
+  --feature_layers "layer3,layer4" --cluster_backend vmf_softmax --vmf_kappa 20.0 \
+  --cluster_clean_ratio 0.8 --kmeans_n_init 10
 ```
 
 ## Usage
@@ -63,19 +70,21 @@ python scripts/adapt_me_iis.py --dataset_name office_home --data_root datasets/O
 ## Configuration
 - Controlled via CLI flags (see per-folder READMEs).
 - Dataset roots default to `datasets/Office-Home` / `datasets/Office-31` or auto-resolve on Colab.
+- Clustering backends: `--cluster_backend gmm` (default) or `vmf_softmax`. For the vMF-like backend, `--vmf_kappa` controls concentration and `--kmeans_n_init` controls prototype restarts. `--cluster_clean_ratio <1` fits clustering on the lowest-entropy target predictions but still computes target moments on all samples.
 - Default feature layers: `layer3,layer4` (avgpool is opt-in).
 - CSV logs under `results/`.
 
 ## Project Layout
-- `scripts/` – Training, adaptation, evaluation, ablations, sanity checks.
-- `models/` – ResNet-50 backbone, classifier head, ME–IIS adapter.
-- `utils/` – Data, feature, logging, seed helpers.
-- `datasets/` – Dataset loaders and (optional) dataset trees.
-- `tests/` – Unit and integration tests.
-- `env/` – Requirements files.
-- `results/` – CSV and IIS artifacts.
-- `checkpoints/` – Saved source/adapted weights.
-- `ME_IIS_Colab.ipynb` – Colab pipeline.
+- `scripts/` - Training, adaptation, evaluation, ablations, sanity checks.
+- `models/` - ResNet-50 backbone, classifier head, ME-IIS adapter.
+- `clustering/` - Pluggable clustering backends (GMM, vMF-softmax prototypes).
+- `utils/` - Data, feature, logging, seed helpers.
+- `datasets/` - Dataset loaders and (optional) dataset trees.
+- `tests/` - Unit and integration tests.
+- `env/` - Requirements files.
+- `results/` - CSV and IIS artifacts.
+- `checkpoints/` - Saved source/adapted weights.
+- `ME_IIS_Colab.ipynb` - Colab pipeline.
 
 ## Folder-level Documentation
 - checkpoints

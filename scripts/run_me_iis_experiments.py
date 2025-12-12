@@ -200,6 +200,10 @@ def run_adaptation(
         gmm_selection_mode=gmm_selection_mode,
         gmm_bic_min_components=bic_min if bic_min is not None else base_args.gmm_bic_min_components,
         gmm_bic_max_components=bic_max if bic_max is not None else base_args.gmm_bic_max_components,
+        cluster_backend=base_args.cluster_backend,
+        vmf_kappa=base_args.vmf_kappa,
+        cluster_clean_ratio=base_args.cluster_clean_ratio,
+        kmeans_n_init=base_args.kmeans_n_init,
         feature_layers=",".join(feature_layers),
         source_prob_mode=base_args.source_prob_mode,
         iis_iters=base_args.iis_iters,
@@ -475,6 +479,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gmm_bic_min_components", type=int, default=2)
     parser.add_argument("--gmm_bic_max_components", type=int, default=15)
+    parser.add_argument("--cluster_backend", type=str, default="gmm", choices=["gmm", "vmf_softmax"])
+    parser.add_argument("--vmf_kappa", type=float, default=20.0)
+    parser.add_argument("--cluster_clean_ratio", type=float, default=1.0)
+    parser.add_argument("--kmeans_n_init", type=int, default=10)
     parser.add_argument("--feature_layers", type=str, default="layer3,layer4")
     parser.add_argument("--source_prob_mode", type=str, default="softmax", choices=["softmax", "onehot"])
     parser.add_argument("--iis_iters", type=int, default=15)
