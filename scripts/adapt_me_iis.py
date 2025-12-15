@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -28,6 +29,7 @@ from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, upsert_csv_row
 from utils.feature_utils import extract_features
 from utils.env_utils import is_colab
+from utils.persist_paths import legacy_checkpoints_dir, legacy_results_dir, persistent_dataset_root, resolve_persist_root
 from utils.resource_utils import (
     auto_resources_enabled,
     auto_tune_dataloader,
@@ -109,7 +111,9 @@ def _build_adapt_ckpt_path(args: argparse.Namespace, layer_tag: str, epoch: Opti
     base = f"me_iis_{args.source_domain}_to_{args.target_domain}_{layer_tag}_seed{args.seed}"
     if epoch is not None:
         base += f"_epoch{epoch}"
-    return Path("checkpoints") / f"{base}.pth"
+    ckpt_dir = legacy_checkpoints_dir()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    return ckpt_dir / f"{base}.pth"
 
 
 class IndexedDataset(Dataset):
@@ -196,6 +200,11 @@ def _maybe_resolve_data_root(args) -> str:
 
     name = normalize_dataset_name(args.dataset_name)
 
+    persist_ds = persistent_dataset_root(args.dataset_name)
+    if persist_ds is not None and persist_ds.exists():
+        print(f"[DATA] Using persistent dataset root: {persist_ds}")
+        return str(persist_ds)
+
     if is_colab():
         try:
             import kagglehub  # type: ignore
@@ -214,6 +223,11 @@ def _maybe_resolve_data_root(args) -> str:
         else:
             raise ValueError(f"Unknown dataset_name '{args.dataset_name}' for KaggleHub resolution.")
         print(f"[DATA] Resolved dataset '{args.dataset_name}' via KaggleHub at: {root_path}")
+        if persist_ds is not None:
+            persist_ds.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[DATA] Copying dataset to persistent location: {persist_ds}")
+            shutil.copytree(root_path, persist_ds, dirs_exist_ok=True)
+            return str(persist_ds)
         return str(root_path)
 
     if name == "officehome":
@@ -413,6 +427,16 @@ def adapt_me_iis(args) -> None:
 
     if getattr(args, "auto_resources", False):
         os.environ["ME_IIS_AUTO_RESOURCES"] = "1"
+
+    ckpt_dir = legacy_checkpoints_dir()
+    results_dir = legacy_results_dir()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    persist_root = resolve_persist_root()
+    if persist_root is not None:
+        print(f"[Persist] Using persist root: {persist_root}")
+        print(f"[Persist] Checkpoints: {ckpt_dir}")
+        print(f"[Persist] Results:     {results_dir}")
     print(f"[Seed] Using seed {args.seed} (deterministic={args.deterministic})")
     if args.dry_run_max_batches > 0:
         print(f"[DRY RUN] Limiting feature extraction and adaptation to {args.dry_run_max_batches} batches.")
@@ -507,7 +531,7 @@ def adapt_me_iis(args) -> None:
         for p in model.backbone.parameters():
             p.requires_grad = False
 
-    resources = detect_resources(disk_path=Path("checkpoints"), data_path=data_root, cuda_device=int(getattr(device, "index", 0) or 0))
+    resources = detect_resources(disk_path=ckpt_dir, data_path=data_root, cuda_device=int(getattr(device, "index", 0) or 0))
     resume_candidate = Path(args.resume_adapt_from) if getattr(args, "resume_adapt_from", None) else None
     allow_batch_tune = auto_resources_enabled(default=False) and (resume_candidate is None or not resume_candidate.exists())
     dl_tuning = auto_tune_dataloader(
@@ -638,8 +662,7 @@ def adapt_me_iis(args) -> None:
         raise ValueError("IIS weight vector length does not match source training set.")
     print("[ADAPT] IIS solve completed, saving artifacts and running weighted fine-tuning...")
     history_path = (
-        Path("results")
-        / f"me_iis_weights_{args.source_domain}_to_{args.target_domain}_{layer_tag}_seed{args.seed}_{run_id}.npz"
+        results_dir / f"me_iis_weights_{args.source_domain}_to_{args.target_domain}_{layer_tag}_seed{args.seed}_{run_id}.npz"
     )
     save_iis_history(history_path, weights, history)
 
@@ -859,7 +882,7 @@ def adapt_me_iis(args) -> None:
                 "config_json": config_json,
                 "timestamp_utc": legacy_timestamp_utc(),
             },
-            path=Path("results/office_home_me_iis.csv"),
+            path=(results_dir / "office_home_me_iis.csv"),
             fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
             unique_key="run_id",
         )

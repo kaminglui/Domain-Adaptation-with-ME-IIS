@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -25,6 +26,7 @@ from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from src.experiments.legacy_results import legacy_run_id_and_config_json, legacy_timestamp_utc, legacy_train_payload
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, upsert_csv_row
 from utils.env_utils import is_colab
+from utils.persist_paths import legacy_checkpoints_dir, legacy_results_dir, persistent_dataset_root, resolve_persist_root
 from utils.resource_utils import (
     auto_resources_enabled,
     auto_tune_dataloader,
@@ -109,6 +111,11 @@ def _maybe_resolve_data_root(args) -> str:
 
     name = normalize_dataset_name(args.dataset_name)
 
+    persist_ds = persistent_dataset_root(args.dataset_name)
+    if persist_ds is not None and persist_ds.exists():
+        print(f"[DATA] Using persistent dataset root: {persist_ds}")
+        return str(persist_ds)
+
     if is_colab():
         try:
             import kagglehub  # type: ignore
@@ -127,6 +134,11 @@ def _maybe_resolve_data_root(args) -> str:
         else:
             raise ValueError(f"Unknown dataset_name '{args.dataset_name}' for KaggleHub resolution.")
         print(f"[DATA] Resolved dataset '{args.dataset_name}' via KaggleHub at: {root_path}")
+        if persist_ds is not None:
+            persist_ds.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[DATA] Copying dataset to persistent location: {persist_ds}")
+            shutil.copytree(root_path, persist_ds, dirs_exist_ok=True)
+            return str(persist_ds)
         return str(root_path)
 
     if name == "officehome":
@@ -181,7 +193,18 @@ def train_source(args) -> None:
     if getattr(args, "auto_resources", False):
         os.environ["ME_IIS_AUTO_RESOURCES"] = "1"
 
-    ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed)
+    ckpt_dir = legacy_checkpoints_dir()
+    results_dir = legacy_results_dir()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    persist_root = resolve_persist_root()
+    if persist_root is not None:
+        print(f"[Persist] Using persist root: {persist_root}")
+        print(f"[Persist] Checkpoints: {ckpt_dir}")
+        print(f"[Persist] Results:     {results_dir}")
+
+    ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed, base_dir=str(ckpt_dir))
     if getattr(args, "resume_from", None) in (None, "") and ckpt_path.exists():
         args.resume_from = str(ckpt_path)
         print(f"[CKPT] Auto-resume: found existing source checkpoint at {ckpt_path}")
@@ -396,8 +419,7 @@ def train_source(args) -> None:
             )
             if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
                 epoch_ckpt_path = (
-                    Path("checkpoints")
-                    / f"source_only_{args.source_domain}_to_{args.target_domain}_seed{args.seed}_epoch{epoch+1}.pth"
+                    ckpt_dir / f"source_only_{args.source_domain}_to_{args.target_domain}_seed{args.seed}_epoch{epoch+1}.pth"
                 )
                 checkpoint = {
                     "backbone": model.backbone.state_dict(),
@@ -416,7 +438,7 @@ def train_source(args) -> None:
 
         print("[TRAIN] Finished training loop, preparing checkpoint...")
         sys.stdout.flush()
-        ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed)
+        ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed, base_dir=str(ckpt_dir))
         checkpoint = {
             "backbone": model.backbone.state_dict(),
             "classifier": model.classifier.state_dict(),
@@ -432,7 +454,7 @@ def train_source(args) -> None:
         legacy_payload = legacy_train_payload(vars(args))
         run_id, config_json = legacy_run_id_and_config_json(legacy_payload)
         upsert_csv_row(
-            path="results/office_home_me_iis.csv",
+            path=str(results_dir / "office_home_me_iis.csv"),
             fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
             row={
                 "dataset": dataset_field,

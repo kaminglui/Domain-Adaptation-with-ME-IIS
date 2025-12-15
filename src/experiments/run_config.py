@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from utils.experiment_utils import dataset_tag
+from utils.persist_paths import resolve_persist_root
 
 
 def _json_safe(obj: Any) -> Any:
@@ -40,6 +42,12 @@ def compute_run_id(config_obj: Any) -> str:
 
 
 def default_runs_root() -> Path:
+    override = os.getenv("ME_IIS_RUNS_ROOT")
+    if override:
+        return Path(override)
+    persist_root = resolve_persist_root()
+    if persist_root is not None:
+        return Path(persist_root) / "outputs" / "runs"
     return Path("outputs") / "runs"
 
 
@@ -105,4 +113,3 @@ class RunConfig:
     @property
     def run_id(self) -> str:
         return compute_run_id(self)
-
