@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -24,6 +25,13 @@ from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from src.experiments.legacy_results import legacy_run_id_and_config_json, legacy_timestamp_utc, legacy_train_payload
 from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, upsert_csv_row
 from utils.env_utils import is_colab
+from utils.resource_utils import (
+    auto_resources_enabled,
+    auto_tune_dataloader,
+    detect_resources,
+    format_bytes,
+    tune_checkpoint_saving,
+)
 from utils.seed_utils import get_device, set_seed
 from utils.experiment_utils import build_source_ckpt_path, dataset_tag, normalize_dataset_name
 
@@ -170,6 +178,9 @@ def train_source(args) -> None:
     if data_root is not None and not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
 
+    if getattr(args, "auto_resources", False):
+        os.environ["ME_IIS_AUTO_RESOURCES"] = "1"
+
     ckpt_path = build_source_ckpt_path(args.source_domain, args.target_domain, args.seed)
     if getattr(args, "resume_from", None) in (None, "") and ckpt_path.exists():
         args.resume_from = str(ckpt_path)
@@ -219,6 +230,63 @@ def train_source(args) -> None:
 
     num_classes = _infer_num_classes(source_loader)
     model = build_model(num_classes=num_classes, pretrained=True).to(device)
+
+    resources = detect_resources(disk_path=ckpt_path.parent, data_path=data_root, cuda_device=int(getattr(device, "index", 0) or 0))
+    resume_candidate = Path(args.resume_from) if getattr(args, "resume_from", None) else None
+    allow_batch_tune = auto_resources_enabled(default=False) and (resume_candidate is None or not resume_candidate.exists())
+    dl_tuning = auto_tune_dataloader(
+        base_batch_size=int(args.batch_size),
+        base_num_workers=int(args.num_workers),
+        device=device,
+        resources=resources,
+        model=model if allow_batch_tune else None,
+        input_size=224,
+        num_classes=int(num_classes),
+    )
+    if auto_resources_enabled(default=False):
+        ckpt_tuning = tune_checkpoint_saving(
+            disk_free_bytes=resources.disk_free_bytes,
+            total_epochs=int(args.num_epochs),
+            save_every_epochs_requested=int(args.save_every),
+            model=model,
+        )
+        if int(ckpt_tuning.save_every_epochs) != int(args.save_every):
+            print(f"[AUTO_RESOURCES] train_source: save_every {args.save_every}->{ckpt_tuning.save_every_epochs}")
+        args.save_every = int(ckpt_tuning.save_every_epochs)
+        if allow_batch_tune and int(dl_tuning.batch_size) != int(args.batch_size):
+            print(f"[AUTO_RESOURCES] train_source: batch_size {args.batch_size}->{dl_tuning.batch_size}")
+        if int(dl_tuning.num_workers) != int(args.num_workers):
+            print(f"[AUTO_RESOURCES] train_source: num_workers {args.num_workers}->{dl_tuning.num_workers}")
+        print(
+            f"[AUTO_RESOURCES] GPU free={format_bytes(resources.cuda_free_bytes)} "
+            f"CPU avail={format_bytes(resources.cpu_available_bytes)} disk_free={format_bytes(resources.disk_free_bytes)}"
+        )
+
+    args.num_workers = int(dl_tuning.num_workers)
+    if allow_batch_tune:
+        args.batch_size = int(dl_tuning.batch_size)
+
+    loader_kwargs = dl_tuning.as_loader_kwargs()
+    source_loader = build_loader(
+        source_ds,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        seed=int(args.seed),
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    target_eval_loader = build_loader(
+        target_eval_ds,
+        batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        seed=int(args.seed),
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
 
     def _make_optimizer_and_scheduler(current_model: nn.Module):
         params = [

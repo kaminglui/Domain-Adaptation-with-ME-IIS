@@ -26,6 +26,14 @@ from src.experiments.checkpointing import (
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.run_config import RunConfig, get_run_dir, save_config
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
+from utils.resource_utils import (
+    auto_tune_dataloader,
+    auto_resources_enabled,
+    detect_resources,
+    format_bytes,
+    tune_checkpoint_saving,
+    write_resource_snapshot,
+)
 from utils.seed_utils import get_device, set_seed
 
 
@@ -120,27 +128,71 @@ def run(
 
     source_ds = source_loader.dataset
     target_eval_ds = target_eval_loader.dataset
-    source_loader = build_loader(
-        source_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        seed=config.seed,
-        generator=data_generator,
-        drop_last=False,
-    )
-    target_eval_loader = build_loader(
-        target_eval_ds,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        seed=config.seed,
-        generator=data_generator,
-        drop_last=False,
-    )
 
     num_classes = _infer_num_classes(source_loader)
     model = build_model(num_classes=num_classes, pretrained=config.backbone_pretrained).to(device)
+
+    if auto_resources_enabled(default=False):
+        resources = detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0))
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=resources,
+            model=model,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+        ckpt_tuning = tune_checkpoint_saving(
+            disk_free_bytes=resources.disk_free_bytes,
+            total_epochs=int(config.epochs_source),
+            save_every_epochs_requested=int(save_every_epochs),
+            model=model,
+        )
+        write_resource_snapshot(
+            run_dir,
+            resources,
+            tuning={"dataloader": asdict(dl_tuning), "checkpoint": asdict(ckpt_tuning)},
+        )
+        if dl_tuning.batch_size != config.batch_size or dl_tuning.num_workers != config.num_workers:
+            print(
+                f"[AUTO_RESOURCES] source_only: batch_size {config.batch_size}->{dl_tuning.batch_size}, "
+                f"num_workers {config.num_workers}->{dl_tuning.num_workers} "
+                f"(GPU free={format_bytes(resources.cuda_free_bytes)} disk_free={format_bytes(resources.disk_free_bytes)})"
+            )
+        save_every_epochs = int(ckpt_tuning.save_every_epochs)
+    else:
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0)),
+            model=None,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+
+    loader_kwargs = dl_tuning.as_loader_kwargs()
+    source_loader = build_loader(
+        source_ds,
+        batch_size=dl_tuning.batch_size,
+        shuffle=True,
+        num_workers=dl_tuning.num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    target_eval_loader = build_loader(
+        target_eval_ds,
+        batch_size=dl_tuning.batch_size,
+        shuffle=False,
+        num_workers=dl_tuning.num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
 
     def _make_optimizer_and_scheduler(current_model: nn.Module):
         params = [
@@ -280,4 +332,3 @@ def run(
         "best_target_acc": float(best_target_acc),
         "source_acc": float(final_source_acc),
     }
-

@@ -1,6 +1,7 @@
 """
 Shared helpers for building reproducible DataLoaders.
 """
+import inspect
 import random
 from typing import Optional
 
@@ -34,10 +35,22 @@ def build_loader(
     seed: int,
     drop_last: bool = False,
     generator: Optional[torch.Generator] = None,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: Optional[int] = None,
 ) -> DataLoader:
     """Construct a DataLoader with optional shared generator and seeded workers."""
     worker_init = make_worker_init_fn(seed) if num_workers > 0 else None
     gen = generator if generator is not None else make_generator(seed)
+    supported = set(inspect.signature(DataLoader).parameters.keys())
+    kwargs = {}
+    if "pin_memory" in supported:
+        kwargs["pin_memory"] = bool(pin_memory)
+    if num_workers > 0:
+        if "persistent_workers" in supported:
+            kwargs["persistent_workers"] = bool(persistent_workers)
+        if prefetch_factor is not None and "prefetch_factor" in supported:
+            kwargs["prefetch_factor"] = int(prefetch_factor)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -46,4 +59,5 @@ def build_loader(
         worker_init_fn=worker_init,
         generator=gen,
         drop_last=drop_last,
+        **kwargs,
     )

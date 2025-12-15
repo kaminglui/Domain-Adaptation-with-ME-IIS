@@ -29,6 +29,14 @@ from src.experiments.data import DropLabelsDataset, assert_labels_dropped
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.run_config import RunConfig, get_run_dir, save_config
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
+from utils.resource_utils import (
+    auto_resources_enabled,
+    auto_tune_dataloader,
+    detect_resources,
+    format_bytes,
+    tune_checkpoint_saving,
+    write_resource_snapshot,
+)
 from utils.seed_utils import get_device, set_seed
 
 
@@ -194,6 +202,81 @@ def run(
         for p in model.backbone.parameters():
             p.requires_grad = False
 
+    resources = detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0))
+    if auto_resources_enabled(default=False):
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=resources,
+            model=model,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+        ckpt_tuning = tune_checkpoint_saving(
+            disk_free_bytes=resources.disk_free_bytes,
+            total_epochs=int(config.epochs_adapt),
+            save_every_epochs_requested=int(save_every_epochs),
+            model=model,
+        )
+        write_resource_snapshot(
+            run_dir,
+            resources,
+            tuning={"dataloader": asdict(dl_tuning), "checkpoint": asdict(ckpt_tuning)},
+        )
+        if dl_tuning.batch_size != config.batch_size or dl_tuning.num_workers != config.num_workers:
+            print(
+                f"[AUTO_RESOURCES] dann: batch_size {config.batch_size}->{dl_tuning.batch_size}, "
+                f"num_workers {config.num_workers}->{dl_tuning.num_workers} "
+                f"(GPU free={format_bytes(resources.cuda_free_bytes)} disk_free={format_bytes(resources.disk_free_bytes)})"
+            )
+        save_every_epochs = int(ckpt_tuning.save_every_epochs)
+    else:
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=resources,
+            model=None,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+
+    loader_kwargs = dl_tuning.as_loader_kwargs()
+    batch_size = int(dl_tuning.batch_size)
+    num_workers = int(dl_tuning.num_workers)
+
+    source_loader = build_loader(
+        source_train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    target_loader = build_loader(
+        target_train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    target_eval_loader = build_loader(
+        target_eval_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+
     backbone_lr = config.classifier_lr * config.backbone_lr_scale
     groups = [
         {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": backbone_lr},
@@ -252,21 +335,23 @@ def run(
     target_align_ds: Dataset = DropLabelsDataset(target_eval_ds)
     source_align_loader = build_loader(
         source_align_ds,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
+        **loader_kwargs,
     )
     target_align_loader = build_loader(
         target_align_ds,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
+        **loader_kwargs,
     )
     source_align_iter = _cycle(source_align_loader)
     target_align_iter = _cycle(target_align_loader)

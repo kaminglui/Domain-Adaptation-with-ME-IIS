@@ -45,6 +45,7 @@ class TrainConfig:
     lr_classifier: float = 1e-2
     weight_decay: float = 1e-3
     num_workers: int = 4
+    auto_resources: bool = False
     deterministic: bool = False
     seed: int = 0
     dry_run_max_batches: int = 0
@@ -63,6 +64,7 @@ class AdaptConfig:
     checkpoint: str = ""
     batch_size: int = 32
     num_workers: int = 4
+    auto_resources: bool = False
     num_latent_styles: int = 5
     components_per_layer: Optional[str] = None
     gmm_selection_mode: str = "fixed"
@@ -106,6 +108,7 @@ class ExperimentConfig:
     num_epochs: int = 50
     batch_size: int = 32
     num_workers: int = 4
+    auto_resources: bool = False
     lr_backbone: float = 1e-3
     lr_classifier: float = 1e-2
     weight_decay: float = 1e-3
@@ -179,6 +182,11 @@ def build_train_parser() -> argparse.ArgumentParser:
     train.add_argument("--lr_classifier", type=float, default=1e-2)
     train.add_argument("--weight_decay", type=float, default=1e-3)
     train.add_argument("--num_workers", type=int, default=4)
+    train.add_argument(
+        "--auto_resources",
+        action="store_true",
+        help="Enable automatic tuning for batch_size/num_workers/checkpoint saving based on detected RAM/VRAM/disk.",
+    )
 
     repro = parser.add_argument_group("Reproducibility")
     repro.add_argument(
@@ -236,6 +244,11 @@ def build_adapt_parser() -> argparse.ArgumentParser:
     model = parser.add_argument_group("Model / Backbone")
     model.add_argument("--batch_size", type=int, default=32)
     model.add_argument("--num_workers", type=int, default=4)
+    model.add_argument(
+        "--auto_resources",
+        action="store_true",
+        help="Enable automatic tuning for batch_size/num_workers/checkpoint saving based on detected RAM/VRAM/disk.",
+    )
     model.add_argument("--feature_layers", type=str, default="layer3,layer4", help="Comma-separated feature layers.")
     model.add_argument(
         "--source_prob_mode",
@@ -367,6 +380,11 @@ def build_experiments_parser() -> argparse.ArgumentParser:
     train.add_argument("--num_epochs", type=int, default=50, help="Source-only epochs.")
     train.add_argument("--batch_size", type=int, default=32)
     train.add_argument("--num_workers", type=int, default=4)
+    train.add_argument(
+        "--auto_resources",
+        action="store_true",
+        help="Enable automatic tuning for per-run batch_size/num_workers based on detected RAM/VRAM/disk.",
+    )
     train.add_argument("--lr_backbone", type=float, default=1e-3)
     train.add_argument("--lr_classifier", type=float, default=1e-2)
     train.add_argument("--weight_decay", type=float, default=1e-3)
@@ -441,4 +459,3 @@ def parse_adapt_config(argv: Optional[list[str]] = None) -> AdaptConfig:
 def parse_experiments_config(argv: Optional[list[str]] = None) -> ExperimentConfig:
     args = build_experiments_parser().parse_args(argv)
     return ExperimentConfig(**vars(args))
-

@@ -33,6 +33,14 @@ from src.experiments.pseudo_labeling import PseudoLabeledDataset, build_pseudo_l
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.experiment_utils import build_components_map, parse_feature_layers
 from utils.feature_utils import extract_features
+from utils.resource_utils import (
+    auto_resources_enabled,
+    auto_tune_dataloader,
+    detect_resources,
+    format_bytes,
+    tune_checkpoint_saving,
+    write_resource_snapshot,
+)
 from utils.seed_utils import get_device, set_seed
 
 
@@ -242,14 +250,63 @@ def run(
     model.backbone.load_state_dict(source_ckpt["backbone"])
     model.classifier.load_state_dict(source_ckpt["classifier"])
 
+    if not config.finetune_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+
+    resources = detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0))
+    if auto_resources_enabled(default=False):
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=resources,
+            model=model,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+        ckpt_tuning = tune_checkpoint_saving(
+            disk_free_bytes=resources.disk_free_bytes,
+            total_epochs=int(config.epochs_adapt),
+            save_every_epochs_requested=int(save_every_epochs),
+            model=model,
+        )
+        write_resource_snapshot(
+            run_dir,
+            resources,
+            tuning={"dataloader": asdict(dl_tuning), "checkpoint": asdict(ckpt_tuning)},
+        )
+        if dl_tuning.batch_size != config.batch_size or dl_tuning.num_workers != config.num_workers:
+            print(
+                f"[AUTO_RESOURCES] me_iis: batch_size {config.batch_size}->{dl_tuning.batch_size}, "
+                f"num_workers {config.num_workers}->{dl_tuning.num_workers} "
+                f"(GPU free={format_bytes(resources.cuda_free_bytes)} disk_free={format_bytes(resources.disk_free_bytes)})"
+            )
+        save_every_epochs = int(ckpt_tuning.save_every_epochs)
+    else:
+        dl_tuning = auto_tune_dataloader(
+            base_batch_size=config.batch_size,
+            base_num_workers=config.num_workers,
+            device=device,
+            resources=resources,
+            model=None,
+            input_size=int(config.input_size),
+            num_classes=int(num_classes),
+        )
+
+    loader_kwargs = dl_tuning.as_loader_kwargs()
+    batch_size = int(dl_tuning.batch_size)
+    num_workers = int(dl_tuning.num_workers)
+
     target_eval_loader = build_loader(
         target_eval_ds,
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
+        **loader_kwargs,
     )
     baseline_acc, _ = evaluate(model, target_eval_loader, device)
 
@@ -348,21 +405,23 @@ def run(
     if weights is None:
         source_feat_loader = build_loader(
             source_feat_ds,
-            batch_size=config.batch_size,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
+            num_workers=num_workers,
             seed=config.seed,
             generator=data_generator,
             drop_last=False,
+            **loader_kwargs,
         )
         target_feat_loader = build_loader(
             target_feat_ds,
-            batch_size=config.batch_size,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
+            num_workers=num_workers,
             seed=config.seed,
             generator=data_generator,
             drop_last=False,
+            **loader_kwargs,
         )
         with torch.no_grad():
             source_feats, source_logits, source_labels = extract_features(
@@ -422,24 +481,26 @@ def run(
 
     weighted_loader = build_loader(
         IndexedDataset(source_train_ds),
-        batch_size=config.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
+        **loader_kwargs,
     )
 
     pseudo_loader: Optional[DataLoader] = None
     if use_pseudo_labels:
         target_feat_loader_pl = build_loader(
             target_feat_ds,
-            batch_size=config.batch_size,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=config.num_workers,
+            num_workers=num_workers,
             seed=config.seed,
             generator=data_generator,
             drop_last=False,
+            **loader_kwargs,
         )
         pseudo_indices, pseudo_labels = build_pseudo_labels(
             model=model,
@@ -453,12 +514,13 @@ def run(
             pseudo_ds = PseudoLabeledDataset(target_feat_loader_pl.dataset, pseudo_indices, pseudo_labels)
             pseudo_loader = build_loader(
                 pseudo_ds,
-                batch_size=config.batch_size,
+                batch_size=batch_size,
                 shuffle=True,
-                num_workers=config.num_workers,
+                num_workers=num_workers,
                 seed=config.seed,
                 generator=data_generator,
                 drop_last=False,
+                **loader_kwargs,
             )
 
     total_epochs = int(config.epochs_adapt)
