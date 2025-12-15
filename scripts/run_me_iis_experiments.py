@@ -22,6 +22,11 @@ if str(REPO_ROOT) not in sys.path:
 import scripts.adapt_me_iis as adapt_me_iis
 import scripts.train_source as train_source
 from src.cli.args import ExperimentConfig, build_experiments_parser, dump_config
+from src.experiments.legacy_results import (
+    legacy_adapt_payload,
+    legacy_run_id_and_config_json,
+    legacy_train_payload,
+)
 from utils.experiment_utils import (
     build_components_map,
     build_source_ckpt_path,
@@ -55,6 +60,7 @@ class ResultRow:
     target: str
     seed: int
     method: str
+    run_id: str
     target_acc: float
     source_acc: float
     layers: str
@@ -92,6 +98,7 @@ def read_results_csv(path: Path) -> List[ResultRow]:
                     target=row.get("target", ""),
                     seed=int(row.get("seed", 0)),
                     method=row.get("method", ""),
+                    run_id=row.get("run_id", ""),
                     target_acc=float(row.get("target_acc", 0.0)),
                     source_acc=float(row.get("source_acc", 0.0)),
                     layers=row.get("layers", ""),
@@ -102,22 +109,9 @@ def read_results_csv(path: Path) -> List[ResultRow]:
         return rows
 
 
-def latest_result(
-    rows: Iterable[ResultRow],
-    dataset: str,
-    source: str,
-    target: str,
-    seed: int,
-    method: str,
-) -> Optional[ResultRow]:
-    for row in reversed(list(rows)):
-        if (
-            row.dataset == dataset
-            and row.source == source
-            and row.target == target
-            and row.seed == seed
-            and row.method == method
-        ):
+def result_by_run_id(rows: Iterable[ResultRow], run_id: str) -> Optional[ResultRow]:
+    for row in rows:
+        if row.run_id == run_id:
             return row
     return None
 
@@ -153,18 +147,11 @@ def run_source_training(base_args: argparse.Namespace, seed: int) -> ResultRow:
     )
     print(f"[Driver] Training/resuming source-only model for seed={seed}")
     train_source.train_source(train_args)
-    dataset_field = dataset_tag(base_args.dataset_name)
+    train_run_id, _cfg_json = legacy_run_id_and_config_json(legacy_train_payload(vars(train_args)))
     rows = read_results_csv(Path("results") / "office_home_me_iis.csv")
-    baseline = latest_result(
-        rows=rows,
-        dataset=dataset_field,
-        source=base_args.source_domain,
-        target=base_args.target_domain,
-        seed=seed,
-        method="source_only",
-    )
+    baseline = result_by_run_id(rows=rows, run_id=train_run_id)
     if baseline is None:
-        raise RuntimeError("Baseline source-only result not found after training.")
+        raise RuntimeError(f"Baseline source-only result not found after training (run_id={train_run_id}).")
     return baseline
 
 
@@ -231,26 +218,11 @@ def run_adaptation(
         f"pseudo={use_pseudo_labels}"
     )
     adapt_me_iis.adapt_me_iis(adapt_args)
-    dataset_field = dataset_tag(base_args.dataset_name)
     rows = read_results_csv(Path("results") / "office_home_me_iis.csv")
-    expected_method = method_override
-    if expected_method is None:
-        if use_pseudo_labels:
-            expected_method = "me_iis_pl"
-        elif gmm_selection_mode == "bic":
-            expected_method = "me_iis_bic"
-        else:
-            expected_method = "me_iis"
-    result = latest_result(
-        rows=rows,
-        dataset=dataset_field,
-        source=base_args.source_domain,
-        target=base_args.target_domain,
-        seed=seed,
-        method=expected_method,
-    )
+    adapt_run_id, _cfg_json = legacy_run_id_and_config_json(legacy_adapt_payload(vars(adapt_args)))
+    result = result_by_run_id(rows=rows, run_id=adapt_run_id)
     if result is None:
-        raise RuntimeError(f"Adaptation result (method={expected_method}) not found in CSV log.")
+        raise RuntimeError(f"Adaptation result not found in CSV log (run_id={adapt_run_id}).")
     return result, result.components_per_layer
 
 

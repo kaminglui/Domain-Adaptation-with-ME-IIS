@@ -173,6 +173,11 @@ class JointConstraintBuilder:
             feats = torch.as_tensor(layer_features[layer], dtype=torch.float64, device=self.device)
             gamma = backend.predict_proba(feats.detach().cpu().numpy())
             gamma_t = torch.from_numpy(np.asarray(gamma, dtype=np.float64)).to(self.device)
+            gamma_t = torch.clamp(gamma_t, min=0.0)
+            row_sums = gamma_t.sum(dim=1, keepdim=True)
+            if torch.any(row_sums <= 0):
+                raise ValueError(f"Latent responsibilities for layer '{layer}' contain rows with zero mass.")
+            gamma_t = gamma_t / row_sums
             joint[layer] = gamma_t.unsqueeze(2) * probs.unsqueeze(1)
         return joint
 
@@ -187,6 +192,11 @@ class JointConstraintBuilder:
         joint: Dict[str, torch.Tensor] = {}
         for layer in self.layers:
             gamma = torch.as_tensor(responsibilities[layer], dtype=torch.float64, device=self.device)
+            gamma = torch.clamp(gamma, min=0.0)
+            row_sums = gamma.sum(dim=1, keepdim=True)
+            if torch.any(row_sums <= 0):
+                raise ValueError(f"Provided responsibilities for layer '{layer}' contain rows with zero mass.")
+            gamma = gamma / row_sums
             joint[layer] = gamma.unsqueeze(2) * probs.unsqueeze(1)
         return joint
 

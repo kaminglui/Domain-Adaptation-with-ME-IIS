@@ -14,6 +14,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from src.cli.args import build_adapt_parser, build_train_parser
+from src.experiments.legacy_results import legacy_adapt_payload, legacy_run_id_and_config_json, legacy_train_payload
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -22,20 +25,25 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, text=True, capture_output=True)
 
 
-def _latest_results_row(dataset: str, source: str, target: str) -> Dict[str, float]:
+def _results_row_by_run_id(run_id: str) -> Dict[str, float]:
     csv_path = REPO_ROOT / "results" / "office_home_me_iis.csv"
     if not csv_path.exists():
         return {}
     df = pd.read_csv(csv_path)
-    mask = (df["dataset"] == dataset) & (df["source"] == source) & (df["target"] == target)
+    if "run_id" not in df.columns:
+        return {}
+    mask = df["run_id"].astype(str) == str(run_id)
     if not mask.any():
         return {}
     row = df[mask].iloc[-1]
     return {"target_acc": float(row.get("target_acc", float("nan"))), "source_acc": float(row.get("source_acc", float("nan")))}
 
 
-def _latest_npz(source: str, target: str) -> Optional[Path]:
+def _npz_for_run_id(run_id: str, source: str, target: str) -> Optional[Path]:
     results_dir = REPO_ROOT / "results"
+    candidates = [p for p in results_dir.glob("*.npz") if str(run_id) in p.name]
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
     pattern = f"me_iis_weights_{source}_to_{target}_"
     candidates = [p for p in results_dir.glob("*.npz") if pattern in p.name]
     if not candidates:
@@ -90,9 +98,11 @@ def run_train(
         args.append("--deterministic")
     if quick:
         args += ["--dry_run_max_batches", "2", "--dry_run_max_samples", "4"]
-    result = _run(args)
+    _run(args)
+    parsed = build_train_parser().parse_args(args[2:])
+    run_id, _cfg_json = legacy_run_id_and_config_json(legacy_train_payload(vars(parsed)))
     checkpoint = Path("checkpoints") / f"source_only_{source_domain}_to_{target_domain}_seed{seed}.pth"
-    return {"checkpoint": str(checkpoint)}
+    return {"checkpoint": str(checkpoint), "run_id": run_id}
 
 
 def run_adapt(
@@ -149,11 +159,13 @@ def run_adapt(
     start = time.time()
     _run(args)
     runtime = time.time() - start
-    row = _latest_results_row(dataset_name.replace("_", "-"), source_domain, target_domain)
+    parsed = build_adapt_parser().parse_args(args[2:])
+    run_id, _cfg_json = legacy_run_id_and_config_json(legacy_adapt_payload(vars(parsed)))
+    row = _results_row_by_run_id(run_id)
     target_acc = row.get("target_acc")
     source_acc = row.get("source_acc")
     delta_acc = target_acc - source_acc if target_acc is not None and source_acc is not None else None
-    npz = _latest_npz(source_domain, target_domain)
+    npz = _npz_for_run_id(run_id, source_domain, target_domain)
     iis_err = iis_kl = entropy = None
     if npz is not None:
         data = np.load(npz, allow_pickle=True)
@@ -174,6 +186,7 @@ def run_adapt(
         "history_npz": str(npz) if npz else None,
         "feature_layers": feature_layers,
         "runtime_sec": runtime,
+        "run_id": run_id,
     }
 
 

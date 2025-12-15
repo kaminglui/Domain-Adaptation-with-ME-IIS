@@ -16,7 +16,12 @@ from models.classifier import build_model
 from utils.data_utils import make_generator, make_worker_init_fn
 from utils.env_utils import is_colab
 from utils.experiment_utils import dataset_tag, normalize_dataset_name
-from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
+from src.experiments.legacy_results import (
+    legacy_eval_source_only_payload,
+    legacy_run_id_and_config_json,
+    legacy_timestamp_utc,
+)
+from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, upsert_csv_row
 from utils.seed_utils import get_device, set_seed
 
 
@@ -159,7 +164,9 @@ def eval_source_only(args) -> float:
     print(f"[EVAL] {args.dataset_name}, domain={args.domain}, source-only accuracy={acc:.2f}%")
 
     if args.append_results:
-        append_csv(
+        legacy_payload = legacy_eval_source_only_payload(vars(args))
+        run_id, config_json = legacy_run_id_and_config_json(legacy_payload)
+        upsert_csv_row(
             path=args.results_csv,
             fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
             row={
@@ -168,6 +175,9 @@ def eval_source_only(args) -> float:
                 "target": args.domain,
                 "seed": args.seed,
                 "method": "source_only_self",
+                "run_id": run_id,
+                "status": "evaluated",
+                "error": "",
                 "target_acc": round(acc, 4),
                 "source_acc": round(acc, 4),
                 "num_latent": 0,
@@ -180,7 +190,10 @@ def eval_source_only(args) -> float:
                 "backbone_lr_scale": 1.0,
                 "classifier_lr": "",
                 "source_prob_mode": "",
+                "config_json": config_json,
+                "timestamp_utc": legacy_timestamp_utc(),
             },
+            unique_key="run_id",
         )
     return acc
 

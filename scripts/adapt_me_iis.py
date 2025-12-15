@@ -23,8 +23,9 @@ from eval import evaluate
 from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
 from src.cli.args import AdaptConfig, build_adapt_parser, dump_config
+from src.experiments.legacy_results import legacy_adapt_payload, legacy_run_id_and_config_json, legacy_timestamp_utc
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
-from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, append_csv
+from utils.logging_utils import OFFICE_HOME_ME_IIS_FIELDS, upsert_csv_row
 from utils.feature_utils import extract_features
 from utils.env_utils import is_colab
 from utils.seed_utils import get_device, set_seed
@@ -51,7 +52,12 @@ def _save_npz_safe(data: Dict[str, Any], path: Path) -> None:
         traceback.print_exc()
 
 
-def _append_csv_safe(row: Dict[str, Any], path: Path, fieldnames: Iterable[str]) -> None:
+def _append_csv_safe(
+    row: Dict[str, Any],
+    path: Path,
+    fieldnames: Iterable[str],
+    unique_key: str = "run_id",
+) -> None:
     """
     Append a row to a CSV result file with logging and error handling.
     """
@@ -63,7 +69,7 @@ def _append_csv_safe(row: Dict[str, Any], path: Path, fieldnames: Iterable[str])
         is_new = not path.exists()
         print(f"[RESULTS] Appending row to: {path}")
         sys.stdout.flush()
-        append_csv(path=str(path), fieldnames=fieldnames, row=row)
+        upsert_csv_row(path=str(path), fieldnames=fieldnames, row=row, unique_key=unique_key)
         if is_new:
             # append_csv writes the header for new files.
             pass
@@ -379,6 +385,7 @@ def save_iis_history(path: Path, weights: torch.Tensor, history: List[IISIterati
             "moment_max": [h.max_moment_error for h in history],
             "moment_mean": [h.mean_moment_error for h in history],
             "moment_l2": [h.l2_moment_error for h in history],
+            "num_unachievable_constraints": [h.num_unachievable_constraints for h in history],
             "w_min": [h.weight_min for h in history],
             "w_max": [h.weight_max for h in history],
             "w_entropy": [h.weight_entropy for h in history],
@@ -412,6 +419,8 @@ def adapt_me_iis(args) -> None:
     if getattr(args, "resume_adapt_from", None) in (None, "") and adapt_ckpt_path.exists():
         args.resume_adapt_from = str(adapt_ckpt_path)
         print(f"[CKPT] Auto-resume: found existing ME-IIS checkpoint at {adapt_ckpt_path}")
+    legacy_payload = legacy_adapt_payload(vars(args))
+    run_id, config_json = legacy_run_id_and_config_json(legacy_payload)
     print(
         f"[Config] dataset={args.dataset_name} layers={layer_tag} components_per_layer={components_str} "
         f"finetune_backbone={args.finetune_backbone} backbone_lr_scale={args.backbone_lr_scale} "
@@ -576,7 +585,8 @@ def adapt_me_iis(args) -> None:
         raise ValueError("IIS weight vector length does not match source training set.")
     print("[ADAPT] IIS solve completed, saving artifacts and running weighted fine-tuning...")
     history_path = (
-        Path("results") / f"me_iis_weights_{args.source_domain}_to_{args.target_domain}_{layer_tag}_seed{args.seed}.npz"
+        Path("results")
+        / f"me_iis_weights_{args.source_domain}_to_{args.target_domain}_{layer_tag}_seed{args.seed}_{run_id}.npz"
     )
     save_iis_history(history_path, weights, history)
 
@@ -768,11 +778,7 @@ def adapt_me_iis(args) -> None:
         _save_checkpoint_safe(_build_adapt_checkpoint(last_completed_epoch), adapt_ckpt)
 
         dataset_field = dataset_tag(args.dataset_name)
-        method_tag = "me_iis"
-        if args.use_pseudo_labels:
-            method_tag = "me_iis_pl"
-        elif args.gmm_selection_mode == "bic":
-            method_tag = "me_iis_bic"
+        method_tag = str(legacy_payload.get("method", "me_iis"))
         _append_csv_safe(
             row={
                 "dataset": dataset_field,
@@ -780,6 +786,9 @@ def adapt_me_iis(args) -> None:
                 "target": args.target_domain,
                 "seed": args.seed,
                 "method": method_tag,
+                "run_id": run_id,
+                "status": "resumed" if resume_success else "trained",
+                "error": "",
                 "target_acc": round(adapted_acc, 4),
                 "source_acc": round(acc, 4),
                 "num_latent": total_components,
@@ -792,9 +801,12 @@ def adapt_me_iis(args) -> None:
                 "backbone_lr_scale": args.backbone_lr_scale,
                 "classifier_lr": args.classifier_lr,
                 "source_prob_mode": args.source_prob_mode,
+                "config_json": config_json,
+                "timestamp_utc": legacy_timestamp_utc(),
             },
             path=Path("results/office_home_me_iis.csv"),
             fieldnames=OFFICE_HOME_ME_IIS_FIELDS,
+            unique_key="run_id",
         )
         print("[ADAPT] Weighted adaptation complete.")
     finally:

@@ -17,6 +17,7 @@ class IISIterationStats:
     max_moment_error: float
     mean_moment_error: float
     l2_moment_error: float
+    num_unachievable_constraints: int
     weight_min: float
     weight_max: float
     weight_entropy: float
@@ -329,6 +330,7 @@ class MaxEntAdapter:
                 max_moment_error=max_abs_error,
                 mean_moment_error=float(moment_error.abs().mean().detach().cpu().item()),
                 l2_moment_error=l2_error,
+                num_unachievable_constraints=len(self.unachievable_constraints),
                 weight_min=float(w_cpu.min().item()),
                 weight_max=float(w_cpu.max().item()),
                 weight_entropy=entropy,

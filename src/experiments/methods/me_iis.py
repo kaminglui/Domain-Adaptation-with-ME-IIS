@@ -144,6 +144,7 @@ def _save_iis_npz(path: Path, weights: torch.Tensor, history: List[IISIterationS
         moment_max=[h.max_moment_error for h in history],
         moment_mean=[h.mean_moment_error for h in history],
         moment_l2=[h.l2_moment_error for h in history],
+        num_unachievable_constraints=[h.num_unachievable_constraints for h in history],
         w_min=[h.weight_min for h in history],
         w_max=[h.weight_max for h in history],
         w_entropy=[h.weight_entropy for h in history],
