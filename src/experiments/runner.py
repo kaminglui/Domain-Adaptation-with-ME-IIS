@@ -54,6 +54,7 @@ def run_one(
     force_rerun: bool = False,
     runs_root: Optional[Path] = None,
     write_metrics: bool = True,
+    raise_on_error: bool = True,
 ) -> Dict[str, Any]:
     """
     Run a single method for a single seed, with:
@@ -61,65 +62,91 @@ def run_one(
     - skip/resume behavior,
     - unified evaluation + metrics.csv writing.
     """
-    if config.method == "source_only":
-        run_res = _run_with_logs(
-            config,
-            source_only.run,
-            config,
-            force_rerun=force_rerun,
-            runs_root=runs_root,
-        )
-        ckpt_path = Path(run_res["checkpoint"])
-    else:
-        src_cfg = derive_source_only_config(config)
-        src_res = _run_with_logs(
-            src_cfg,
-            source_only.run,
-            src_cfg,
-            force_rerun=False,
-            runs_root=runs_root,
-        )
-        src_ckpt_path = Path(src_res["checkpoint"])
-
-        if config.method in {"me_iis", "me_iis_pl"}:
+    try:
+        if config.method == "source_only":
             run_res = _run_with_logs(
                 config,
-                me_iis.run,
+                source_only.run,
                 config,
-                source_checkpoint=src_ckpt_path,
                 force_rerun=force_rerun,
                 runs_root=runs_root,
             )
-        elif config.method == "dann":
-            run_res = _run_with_logs(
-                config,
-                dann.run,
-                config,
-                source_checkpoint=src_ckpt_path,
-                force_rerun=force_rerun,
-                runs_root=runs_root,
-            )
-        elif config.method == "coral":
-            run_res = _run_with_logs(
-                config,
-                coral.run,
-                config,
-                source_checkpoint=src_ckpt_path,
-                force_rerun=force_rerun,
-                runs_root=runs_root,
-            )
-        elif config.method == "pseudo_label":
-            run_res = _run_with_logs(
-                config,
-                pseudo_label.run,
-                config,
-                source_checkpoint=src_ckpt_path,
-                force_rerun=force_rerun,
-                runs_root=runs_root,
-            )
+            ckpt_path = Path(run_res["checkpoint"])
         else:
-            raise ValueError(f"Unknown method '{config.method}'")
-        ckpt_path = Path(run_res["checkpoint"])
+            src_cfg = derive_source_only_config(config)
+            src_res = _run_with_logs(
+                src_cfg,
+                source_only.run,
+                src_cfg,
+                force_rerun=False,
+                runs_root=runs_root,
+            )
+            src_ckpt_path = Path(src_res["checkpoint"])
+
+            if config.method in {"me_iis", "me_iis_pl"}:
+                run_res = _run_with_logs(
+                    config,
+                    me_iis.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            elif config.method == "dann":
+                run_res = _run_with_logs(
+                    config,
+                    dann.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            elif config.method == "coral":
+                run_res = _run_with_logs(
+                    config,
+                    coral.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            elif config.method == "pseudo_label":
+                run_res = _run_with_logs(
+                    config,
+                    pseudo_label.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            else:
+                raise ValueError(f"Unknown method '{config.method}'")
+            ckpt_path = Path(run_res["checkpoint"])
+    except Exception as exc:
+        run_dir = get_run_dir(config, runs_root=runs_root)
+        artifacts = RunArtifacts(
+            run_dir=run_dir,
+            run_id=config.run_id,
+            stage=_stage_for_method(config.method),
+            method=config.method,
+        )
+        ensure_run_dirs(artifacts)
+        import traceback
+
+        artifacts.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        with artifacts.stderr_path.open("a", encoding="utf-8") as f:
+            f.write("\n" + traceback.format_exc() + "\n")
+        if raise_on_error:
+            raise
+        return {
+            "status": "failed",
+            "run_dir": str(run_dir),
+            "checkpoint": None,
+            "metrics_csv": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            "stdout_path": str(artifacts.stdout_path),
+            "stderr_path": str(artifacts.stderr_path),
+        }
 
     if not write_metrics:
         return run_res

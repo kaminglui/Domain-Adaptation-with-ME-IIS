@@ -52,7 +52,7 @@ def _adapt_epoch(
     model.train()
     pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
 
-    total_loss = 0.0
+    total_loss_sum = 0.0
     total_src = 0
     total_acc = 0.0
     batches_seen = 0
@@ -73,11 +73,17 @@ def _adapt_epoch(
                 pseudo_iter = None
                 pseudo_batch = None
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+
         logits, _ = model(images, return_features=False)
         loss_src = F.cross_entropy(logits, labels)
+        loss_src.backward()
 
-        pseudo_loss = torch.tensor(0.0, device=device)
+        bs = labels.size(0)
+        loss_src_value = float(loss_src.detach().item())
+        total_loss_sum += loss_src_value * bs
+
+        pseudo_loss_value = 0.0
         pseudo_bs = 0
         if pseudo_batch is not None:
             images_tgt, labels_tgt = pseudo_batch
@@ -85,22 +91,22 @@ def _adapt_epoch(
             labels_tgt = labels_tgt.to(device)
             logits_tgt, _ = model(images_tgt, return_features=False)
             pseudo_loss = F.cross_entropy(logits_tgt, labels_tgt)
+            (pseudo_loss_weight * pseudo_loss).backward()
+
             pseudo_bs = labels_tgt.size(0)
             pseudo_used += pseudo_bs
+            pseudo_loss_value = float(pseudo_loss.detach().item())
+            total_loss_sum += float(pseudo_loss_weight) * pseudo_loss_value * pseudo_bs
 
-        loss = loss_src + pseudo_loss_weight * pseudo_loss
-        loss.backward()
         optimizer.step()
 
-        bs = labels.size(0)
         acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
-        total_loss += float(loss.item()) * (bs + pseudo_bs)
         total_acc += acc * bs
         total_src += bs
         batches_seen += 1
 
     denom = total_src + pseudo_used if (pseudo_loader is not None and (total_src + pseudo_used) > 0) else total_src
-    avg_loss = total_loss / denom if denom > 0 else 0.0
+    avg_loss = total_loss_sum / denom if denom > 0 else 0.0
     avg_src_acc = total_acc / total_src if total_src > 0 else 0.0
     return {
         "loss": float(avg_loss),
@@ -140,6 +146,8 @@ def run(
 
     set_seed(config.seed, deterministic=config.deterministic)
     device = get_device(deterministic=config.deterministic)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     data_generator = make_generator(config.seed)
     worker_init = make_worker_init_fn(config.seed)
 
@@ -219,6 +227,30 @@ def run(
         max_ratio=max_ratio,
         num_source_samples=len(source_train_ds),
     )
+    if len(pseudo_indices) != len(pseudo_labels):
+        raise RuntimeError("Pseudo-labeling returned mismatched indices/labels lengths.")
+    if pseudo_indices:
+        min_idx = min(int(i) for i in pseudo_indices)
+        max_idx = max(int(i) for i in pseudo_indices)
+        if min_idx < 0 or max_idx >= len(target_feat_ds):
+            raise ValueError(
+                "Pseudo-label indices out of range for target dataset: "
+                f"[{min_idx}, {max_idx}] vs dataset size {len(target_feat_ds)}"
+            )
+    if pseudo_labels:
+        min_label = min(int(l) for l in pseudo_labels)
+        max_label = max(int(l) for l in pseudo_labels)
+        if min_label < 0 or max_label >= int(num_classes):
+            raise ValueError(
+                "Pseudo-label class ids out of range: "
+                f"[{min_label}, {max_label}] vs num_classes={int(num_classes)}"
+            )
+    print(
+        f"[pseudo_label] pseudo_count={len(pseudo_indices)} conf_thresh={conf_thresh} "
+        f"max_ratio={max_ratio} pseudo_loss_weight={pseudo_loss_weight}"
+    )
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     pseudo_loader: Optional[DataLoader] = None
     if len(pseudo_indices) > 0:
@@ -360,4 +392,3 @@ def run(
         "epoch": int(last_completed_epoch),
         "pseudo_count": int(len(pseudo_indices)),
     }
-
