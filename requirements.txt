@@ -5,3 +5,5 @@ scikit-learn
 tqdm
 Pillow
 tensorboard
+pandas
+matplotlib

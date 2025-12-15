@@ -1,5 +1,5 @@
 # ME-IIS Domain Adaptation
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kaminglui/ME-IIS/blob/main/notebooks/Run_All_Experiments.ipynb)
 
 ## Overview
 ME-IIS implements max-entropy importance sampling for unsupervised domain adaptation on Office-Home and Office-31. It trains a ResNet-50 source classifier, reweights source samples via IIS using style x class constraints, and optionally fine-tunes with pseudo-labels. A Colab notebook and an experiment driver provide end-to-end pipelines, including source-only health checks.
@@ -26,18 +26,18 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
 
 ## Installation
 - Python 3.10+ recommended.
-- Dependencies: PyTorch + torchvision (GPU optional), scikit-learn, tqdm, tensorboard, kagglehub (for Colab).
+- Dependencies: PyTorch + torchvision (GPU optional), scikit-learn, tqdm, tensorboard, pandas/matplotlib (notebook summaries), kagglehub (for Colab).
 - Install:
   ```bash
-  git clone https://github.com/kaminglui/Domain-Adaptation-with-ME-IIS.git
-  cd Domain-Adaptation-with-ME-IIS
+  git clone https://github.com/kaminglui/ME-IIS.git
+  cd ME-IIS
   pip install -r requirements.txt           # minimal
   pip install -r env/requirements_colab.txt # Colab-friendly set
   ```
 - Datasets: place Office-Home under `datasets/Office-Home` or Office-31 under `datasets/Office-31`, or let KaggleHub fetch them on Colab.
 
 ## Quick Start
-- Colab: open the two-stage pseudo-label notebook [ME_IIS_Colab.ipynb](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/ME_IIS_Colab.ipynb).
+- Colab (recommended): open `notebooks/Run_All_Experiments.ipynb` to run ME-IIS + fair UDA baselines with deterministic `run_id`, skip/resume, and unified `metrics.csv`.
 - Train source (Office-Home Art → Clipart):
   ```bash
   python scripts/train_source.py --dataset_name office_home --data_root datasets/Office-Home \
@@ -68,7 +68,37 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
 - Adaptation: `scripts/adapt_me_iis.py`
 - Ablations: `scripts/run_me_iis_experiments.py`
 - Smoke tests: `python run_smoke_tests.py`
-- Notebook: `ME_IIS_Colab.ipynb` (two-stage pseudo-label warm start)
+- Notebook: `notebooks/Run_All_Experiments.ipynb` (ME-IIS + baselines, deterministic run_id, skip/resume, summaries/plots)
+
+## Unified run system (recommended)
+The notebook uses the unified runner in `src/experiments/runner.py` and writes each run to:
+
+`outputs/runs/{dataset}/{src}2{tgt}/{method}/{run_id}/`
+- `config.json` (canonical config used to hash `run_id`)
+- `logs/stdout.txt`, `logs/stderr.txt`
+- `checkpoints/` (deterministic filenames include `run_id`)
+- `metrics.csv` (single-row CSV with unified columns for fair comparisons)
+
+Run one experiment locally from Python:
+```python
+from src.experiments.run_config import RunConfig
+from src.experiments.runner import run_one
+
+cfg = RunConfig(
+    dataset_name="office_home",
+    data_root="datasets/Office-Home",
+    source_domain="Ar",
+    target_domain="Cl",
+    method="me_iis",  # source_only | me_iis | dann | coral | pseudo_label
+    epochs_source=50,
+    epochs_adapt=10,
+    batch_size=32,
+    method_params={"feature_layers": ["layer3", "layer4"], "iis_iters": 15, "cluster_backend": "gmm"},
+    seed=0,
+    deterministic=True,
+)
+run_one(cfg, force_rerun=False)
+```
 
 ## Configuration
 - Controlled via CLI flags (see per-folder READMEs).
@@ -110,13 +140,15 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
 - `--dump_config [path]` prints resolved configs as JSON (to stdout by default) and writes to the provided path when given.
 
 ### Logging / Outputs
-- Checkpoints: `checkpoints/source_only_*` and `checkpoints/me_iis_*`.
-- CSV summaries: `results/office_home_me_iis.csv` and experiment sweeps under `results/me_iis_experiments_summary.csv`.
-- IIS weights/history: saved via `_save_npz_safe` under `results/` during adaptation.
+- Deterministic runs (recommended): `outputs/runs/{dataset}/{src}2{tgt}/{method}/{run_id}/` with `config.json`, `logs/`, `checkpoints/`, and `metrics.csv`.
+- Legacy scripts: checkpoints under `checkpoints/` and CSV summaries under `results/` (e.g., `results/office_home_me_iis.csv`).
+- ME-IIS IIS weights/history: saved during adaptation (legacy scripts write under `results/`; unified runs write under each run directory).
 
 ## Project Layout
 - `scripts/` - Training, adaptation, evaluation, ablations, sanity checks.
 - `models/` - ResNet-50 backbone, classifier head, ME-IIS adapter.
+- `notebooks/` - Colab notebooks (recommended entrypoint: `notebooks/Run_All_Experiments.ipynb`).
+- `src/experiments/` - Deterministic config/run_id system, checkpointing, baselines (DANN/CORAL), unified evaluation + metrics logging.
 - `clustering/` - Pluggable clustering backends (GMM, vMF-softmax prototypes).
 - `utils/` - Data, feature, logging, seed helpers.
 - `datasets/` - Dataset loaders and (optional) dataset trees.
@@ -124,7 +156,7 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
 - `env/` - Requirements files.
 - `results/` - CSV and IIS artifacts.
 - `checkpoints/` - Saved source/adapted weights.
-- `ME_IIS_Colab.ipynb` - Colab pipeline.
+- `outputs/` - Deterministic run directories (`outputs/runs/...`).
 
 ## Folder-level Documentation
 - checkpoints
@@ -141,8 +173,12 @@ The method follows the probabilistic-instance IIS extension of maximum entropy a
   `python scripts/generate_cli_reference.py --out docs/cli_reference.md`
 
 ## Colab Experiments
-- Notebook: `ME_IIS_Colab.ipynb`
-  - Includes source-only, ME-IIS GMM, and new `vmf_softmax` experiments plus sweeps (kappa/K/entropy filtering) and layer-placement ablations.
-  - Sections cover setup, data configuration, debugging checks (PMF/joint mass/IIS diagnostics), and recommended next-step sweeps.
-  - Switch to vMF runs by setting `--cluster_backend vmf_softmax` (with `--vmf_kappa`, `--cluster_clean_ratio`, `--kmeans_n_init`) in the config cell.
-- Uses the same CLI flags as the scripts; see [docs/cli_reference.md](docs/cli_reference.md) for flag details.
+- Notebook: `notebooks/Run_All_Experiments.ipynb`
+  - Runs: `source_only`, `me_iis`, `dann`, `coral`, optional `pseudo_label`.
+  - Enforces a shared training budget (configured once) and logs each run to `outputs/runs/.../{run_id}/metrics.csv`.
+
+### Adding a new baseline
+1. Add a method under `src/experiments/methods/` that saves `backbone` + `classifier` in its checkpoint.
+2. Register it in `src/experiments/runner.py:run_one(...)`.
+3. Put method-specific knobs in `RunConfig.method_params` (these are hashed into `run_id`).
+4. Add a small unit test under `tests/` (forward pass + one training step).
