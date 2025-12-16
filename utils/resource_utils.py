@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from utils.env_utils import is_colab
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -31,6 +33,9 @@ def auto_resources_enabled(default: bool = False) -> bool:
     Enable by setting environment variable:
       - ME_IIS_AUTO_RESOURCES=1
     """
+    # Colab-first default: tune automatically unless explicitly disabled.
+    if os.environ.get("ME_IIS_AUTO_RESOURCES") is None:
+        return bool(default) or bool(is_colab())
     return _env_flag("ME_IIS_AUTO_RESOURCES", default=default)
 
 
@@ -559,6 +564,9 @@ def auto_tune_dataloader(
             num_classes=int(num_classes),
             base_batch_size=int(base_batch_size),
         )
+        # For fair comparisons, avoid silently increasing the requested batch size unless explicitly allowed.
+        if not _env_flag("ME_IIS_ALLOW_BATCH_INCREASE", default=False):
+            tuned_bs = min(int(tuned_bs), int(base_batch_size))
 
     return DataLoaderTuning(
         batch_size=int(max(1, tuned_bs)),

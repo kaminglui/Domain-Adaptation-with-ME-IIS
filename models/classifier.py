@@ -18,9 +18,25 @@ class ClassifierHead(nn.Module):
         return self.fc(x)
 
 
-def build_model(num_classes: int, pretrained: bool = True):
-    from models.backbone import ResNet50Backbone, FullModel
+def build_model(
+    num_classes: int,
+    pretrained: bool = True,
+    *,
+    bottleneck_dim: int = 256,
+    bottleneck_bn: bool = True,
+    bottleneck_relu: bool = True,
+    bottleneck_dropout: float = 0.0,
+):
+    from models.backbone import ResNet50Backbone
+    from models.uda_model import Bottleneck, UdaModel
 
     backbone = ResNet50Backbone(pretrained=pretrained)
-    head = ClassifierHead(backbone.out_features, num_classes)
-    return FullModel(backbone, head)
+    bottleneck = Bottleneck(
+        backbone.out_features,
+        int(bottleneck_dim),
+        use_bn=bool(bottleneck_bn),
+        use_relu=bool(bottleneck_relu),
+        dropout=float(bottleneck_dropout),
+    )
+    head = ClassifierHead(bottleneck.out_features, num_classes)
+    return UdaModel(backbone, bottleneck, head)

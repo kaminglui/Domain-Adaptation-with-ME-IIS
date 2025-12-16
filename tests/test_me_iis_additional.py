@@ -1,21 +1,19 @@
-import argparse
 import io
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict
-from unittest import mock
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-import scripts.adapt_me_iis as adapt_me_iis
-import scripts.train_source as train_source
 from datasets.domain_loaders import get_domain_loaders
 from models.me_iis_adapter import ConstraintIndexer, MaxEntAdapter
-from utils.test_utils import build_tiny_model, create_office_home_like, temporary_workdir
+from src.experiments.methods.me_iis import IndexedDataset, adapt_epoch
+from src.experiments.pseudo_labeling import PseudoLabeledDataset, build_pseudo_labels
+from utils.test_utils import build_tiny_model, create_office_home_like
 
 
 def _one_layer_joint_from_components(components: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -310,7 +308,7 @@ class TestPseudoLabelAdaptation(unittest.TestCase):
         source_labels = torch.zeros(8, dtype=torch.long)
         source_ds = torch.utils.data.TensorDataset(source_images, source_labels)
         source_loader = torch.utils.data.DataLoader(
-            adapt_me_iis.IndexedDataset(source_ds), batch_size=2, shuffle=True
+            IndexedDataset(source_ds), batch_size=2, shuffle=True
         )
         weights_vec = torch.ones(len(source_ds)) / float(len(source_ds))
 
@@ -319,7 +317,7 @@ class TestPseudoLabelAdaptation(unittest.TestCase):
         target_labels_dummy = torch.zeros(len(target_images), dtype=torch.long)
         target_ds = torch.utils.data.TensorDataset(target_images, target_labels_dummy)
         target_loader = torch.utils.data.DataLoader(target_ds, batch_size=3, shuffle=False)
-        pseudo_indices, pseudo_labels = adapt_me_iis.build_pseudo_label_dataset(
+        pseudo_indices, pseudo_labels = build_pseudo_labels(
             model=model,
             target_loader=target_loader,
             device=device,
@@ -328,7 +326,7 @@ class TestPseudoLabelAdaptation(unittest.TestCase):
             num_source_samples=len(source_ds),
         )
         self.assertGreater(len(pseudo_indices), 0)
-        pseudo_ds = adapt_me_iis.PseudoLabeledDataset(target_ds, pseudo_indices, pseudo_labels)
+        pseudo_ds = PseudoLabeledDataset(target_ds, pseudo_indices, pseudo_labels)
         pseudo_loader = torch.utils.data.DataLoader(pseudo_ds, batch_size=2, shuffle=True)
 
         def _compute_pseudo_loss() -> float:
@@ -344,12 +342,14 @@ class TestPseudoLabelAdaptation(unittest.TestCase):
 
         initial_pseudo_loss = _compute_pseudo_loss()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        loss, acc, batches, pseudo_used, pseudo_total = adapt_me_iis.adapt_epoch(
+        loss, acc, batches, pseudo_used, pseudo_total = adapt_epoch(
             model=model,
             optimizer=optimizer,
             source_loader=source_loader,
             source_weights_vec=weights_vec,
             device=device,
+            amp_enabled=False,
+            scaler=None,
             max_batches=2,
             pseudo_loader=pseudo_loader,
             pseudo_loss_weight=1.0,
@@ -358,102 +358,6 @@ class TestPseudoLabelAdaptation(unittest.TestCase):
         self.assertGreater(pseudo_total, 0)
         self.assertGreaterEqual(pseudo_used, 0)
         self.assertLess(final_pseudo_loss, initial_pseudo_loss + 1e-4)
-
-
-class TestEndToEndDryRun(unittest.TestCase):
-    def test_train_and_adapt_smoke(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workdir = Path(tmpdir)
-            data_root = workdir / "data"
-            create_office_home_like(
-                data_root, domains=("Ar", "Cl"), classes=("c0", "c1"), images_per_class=3, image_size=32
-            )
-
-            source_args = argparse.Namespace(
-                dataset_name="office_home",
-                data_root=str(data_root),
-                source_domain="Ar",
-                target_domain="Cl",
-                num_epochs=1,
-                resume_from=None,
-                save_every=0,
-                batch_size=2,
-                lr_backbone=1e-3,
-                lr_classifier=1e-2,
-                weight_decay=1e-3,
-                num_workers=0,
-                deterministic=True,
-                seed=0,
-                dry_run_max_batches=2,
-                dry_run_max_samples=4,
-            )
-            with temporary_workdir(workdir):
-                with mock.patch("scripts.train_source.build_model", build_tiny_model), mock.patch(
-                    "scripts.train_source.tqdm", lambda iterable, **_: iterable
-                ), mock.patch("scripts.train_source.sys.stdout.flush", lambda: None):
-                    train_source.train_source(source_args)
-
-            final_ckpt = workdir / "checkpoints" / "source_only_Ar_to_Cl_seed0.pth"
-            self.assertTrue(final_ckpt.exists())
-
-            adapt_args = argparse.Namespace(
-                dataset_name="office_home",
-                data_root=str(data_root),
-                source_domain="Ar",
-                target_domain="Cl",
-                checkpoint=str(final_ckpt),
-                batch_size=2,
-                num_workers=0,
-                num_latent_styles=2,
-                components_per_layer=None,
-                gmm_selection_mode="fixed",
-                gmm_bic_min_components=2,
-                gmm_bic_max_components=8,
-                cluster_backend="gmm",
-                vmf_kappa=20.0,
-                cluster_clean_ratio=1.0,
-                kmeans_n_init=10,
-                feature_layers="layer3,layer4",
-                source_prob_mode="onehot",
-                iis_iters=3,
-                iis_tol=0.1,
-                adapt_epochs=1,
-                resume_adapt_from=None,
-                save_adapt_every=0,
-                finetune_backbone=False,
-                backbone_lr_scale=0.1,
-                classifier_lr=1e-2,
-                weight_decay=1e-3,
-                use_pseudo_labels=False,
-                pseudo_conf_thresh=0.9,
-                pseudo_max_ratio=1.0,
-                pseudo_loss_weight=1.0,
-                dry_run_max_samples=4,
-                dry_run_max_batches=1,
-                deterministic=True,
-                seed=0,
-            )
-            with temporary_workdir(workdir):
-                patchers = [
-                    mock.patch("scripts.adapt_me_iis.build_model", build_tiny_model),
-                    mock.patch("scripts.adapt_me_iis.tqdm", lambda iterable, **_: iterable),
-                    mock.patch("scripts.adapt_me_iis._append_csv_safe", lambda *_, **__: None),
-                    mock.patch("scripts.adapt_me_iis._save_npz_safe", lambda *_, **__: None),
-                    mock.patch("scripts.adapt_me_iis.sys.stdout.flush", lambda: None),
-                ]
-                with patchers[0], patchers[1], patchers[2], patchers[3], patchers[4]:
-                    adapt_me_iis.adapt_me_iis(adapt_args)
-
-            adapt_ckpt = workdir / "checkpoints" / "me_iis_Ar_to_Cl_layer3-layer4_seed0.pth"
-            self.assertTrue(adapt_ckpt.exists())
-            ckpt_data = torch.load(adapt_ckpt, map_location="cpu")
-            weights = ckpt_data.get("weights")
-            self.assertIsNotNone(weights)
-            self.assertAlmostEqual(float(weights.sum().item()), 1.0, places=4)
-            batch_cap = adapt_args.dry_run_max_batches * adapt_args.batch_size
-            sample_cap = adapt_args.dry_run_max_samples
-            expected_len = min(sample_cap, batch_cap) if adapt_args.dry_run_max_batches > 0 else sample_cap
-            self.assertEqual(weights.numel(), expected_len)
 
 
 if __name__ == "__main__":

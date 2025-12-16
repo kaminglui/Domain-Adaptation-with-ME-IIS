@@ -7,3 +7,4 @@ Pillow
 tensorboard
 pandas
 matplotlib
+psutil

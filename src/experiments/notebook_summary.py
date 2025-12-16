@@ -56,10 +56,12 @@ def collect_expected_runs(configs: Iterable[RunConfig], runs_root: Optional[Path
         metrics_path = run_dir / "metrics.csv"
         state_path = run_dir / "state.json"
         stderr_path = run_dir / "logs" / "stderr.txt"
+        signature_path = run_dir / "signature.json"
 
         metrics_row = _read_single_row_csv(metrics_path)
         state = _read_json(state_path)
         stderr_tail = _tail_text(stderr_path)
+        signature = _read_json(signature_path)
 
         status = "NOT RUN"
         if metrics_row is not None:
@@ -85,10 +87,31 @@ def collect_expected_runs(configs: Iterable[RunConfig], runs_root: Optional[Path
             "status": status,
             "run_dir": str(run_dir),
             "metrics_csv": str(metrics_path) if metrics_path.exists() else "",
+            "signature_json": str(signature_path) if signature_path.exists() else "",
+            "signature_fingerprint": str(signature.get("comparison_fingerprint", "")) if signature else "",
             "stderr_tail": stderr_tail,
         }
         if metrics_row is not None:
             row.update(metrics_row)
         rows.append(row)
-    return rows
 
+    # Flag invalid comparisons: different methods with identical signatures (losses + init checkpoint/weights).
+    by_task: Dict[tuple[str, str, str, int, str], List[int]] = {}
+    for idx, row in enumerate(rows):
+        fp = str(row.get("signature_fingerprint", "")).strip()
+        if not fp:
+            continue
+        key = (str(row.get("dataset", "")), str(row.get("src", "")), str(row.get("tgt", "")), int(row.get("seed", -1)), fp)
+        by_task.setdefault(key, []).append(idx)
+
+    for _key, indices in by_task.items():
+        methods = sorted({str(rows[i].get("method", "")) for i in indices})
+        if len(methods) <= 1:
+            continue
+        for i in indices:
+            rows[i]["invalid_comparison"] = True
+            rows[i]["invalid_with_methods"] = ",".join(methods)
+            if rows[i].get("status") == "OK":
+                rows[i]["status"] = "INVALID_COMPARISON"
+
+    return rows

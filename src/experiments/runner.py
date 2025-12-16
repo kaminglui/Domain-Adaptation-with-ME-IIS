@@ -8,9 +8,10 @@ from src.experiments.eval_harness import evaluate_source_and_target
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.checkpointing import ensure_run_dirs
 from src.experiments.metrics import build_metrics_row, get_git_sha, write_metrics_csv
-from src.experiments.methods import coral, dann, me_iis, pseudo_label, source_only
+from src.experiments.methods import cdan, dan, dann, jan, me_iis, pseudo_label, source_only
 from src.experiments.run_config import RunConfig, get_run_dir
 from src.experiments.stream_capture import redirect_std_streams
+from utils.resource_auto import maybe_cache_dataset_to_local
 
 
 def derive_source_only_config(config: RunConfig) -> RunConfig:
@@ -20,15 +21,15 @@ def derive_source_only_config(config: RunConfig) -> RunConfig:
     Important: this intentionally strips adaptation-only knobs so the source checkpoint is reused
     across methods (fair + no redundant retraining).
     """
+    method_params: Dict[str, Any] = {}
+    # Preserve global runtime knobs that should match between source and adapt stages.
+    if "amp" in config.method_params:
+        method_params["amp"] = config.method_params.get("amp")
     return replace(
         config,
         method="source_only",
         epochs_adapt=0,
-        method_params={},
-        finetune_backbone=False,
-        backbone_lr_scale=0.1,
-        classifier_lr=1e-2,
-        feature_layers=("layer3", "layer4"),
+        method_params=method_params,
     )
 
 
@@ -46,7 +47,7 @@ def _run_with_logs(config: RunConfig, fn, *args, runs_root: Optional[Path], **kw
     )
     ensure_run_dirs(artifacts)
     with redirect_std_streams(artifacts.stdout_path, artifacts.stderr_path, mode="a"):
-        return fn(*args, **kwargs)
+        return fn(*args, runs_root=runs_root, **kwargs)
 
 
 def run_one(
@@ -62,6 +63,19 @@ def run_one(
     - skip/resume behavior,
     - unified evaluation + metrics.csv writing.
     """
+    if config.data_root is not None:
+        try:
+            cached_root, cache_info = maybe_cache_dataset_to_local(
+                dataset_name=str(config.dataset_name),
+                data_root=Path(str(config.data_root)),
+            )
+            if str(cached_root) != str(config.data_root):
+                print(f"[DATA][CACHE] {cache_info.get('original_root')} -> {cached_root}")
+                config = replace(config, data_root=str(cached_root))
+        except Exception:
+            pass
+    if bool(config.method_params.get("one_batch_debug", False)):
+        write_metrics = False
     try:
         if config.method == "source_only":
             run_res = _run_with_logs(
@@ -71,7 +85,6 @@ def run_one(
                 force_rerun=force_rerun,
                 runs_root=runs_root,
             )
-            ckpt_path = Path(run_res["checkpoint"])
         else:
             src_cfg = derive_source_only_config(config)
             src_res = _run_with_logs(
@@ -101,10 +114,28 @@ def run_one(
                     force_rerun=force_rerun,
                     runs_root=runs_root,
                 )
-            elif config.method == "coral":
+            elif config.method == "dan":
                 run_res = _run_with_logs(
                     config,
-                    coral.run,
+                    dan.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            elif config.method == "jan":
+                run_res = _run_with_logs(
+                    config,
+                    jan.run,
+                    config,
+                    source_checkpoint=src_ckpt_path,
+                    force_rerun=force_rerun,
+                    runs_root=runs_root,
+                )
+            elif config.method == "cdan":
+                run_res = _run_with_logs(
+                    config,
+                    cdan.run,
                     config,
                     source_checkpoint=src_ckpt_path,
                     force_rerun=force_rerun,
@@ -121,7 +152,6 @@ def run_one(
                 )
             else:
                 raise ValueError(f"Unknown method '{config.method}'")
-            ckpt_path = Path(run_res["checkpoint"])
     except Exception as exc:
         run_dir = get_run_dir(config, runs_root=runs_root)
         artifacts = RunArtifacts(
@@ -147,10 +177,17 @@ def run_one(
             "stdout_path": str(artifacts.stdout_path),
             "stderr_path": str(artifacts.stderr_path),
         }
+    # write_metrics is handled above so we can support debug-style runs that return no checkpoint.
+
+    run_dir = get_run_dir(config, runs_root=runs_root)
+    sig_path = run_dir / "signature.json"
+    if not sig_path.exists():
+        raise RuntimeError(f"Missing signature.json for run: {sig_path}")
 
     if not write_metrics:
         return run_res
 
+    ckpt_path = Path(run_res["checkpoint"])
     if config.data_root is None:
         raise ValueError("data_root must be set to evaluate.")
     data_root = Path(config.data_root)

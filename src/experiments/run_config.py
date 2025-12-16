@@ -9,6 +9,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from utils.experiment_utils import dataset_tag
 from utils.persist_paths import resolve_persist_root
+from utils.env_utils import is_colab
 
 
 def _json_safe(obj: Any) -> Any:
@@ -45,6 +46,9 @@ def default_runs_root() -> Path:
     override = os.getenv("ME_IIS_RUNS_ROOT")
     if override:
         return Path(override)
+    if is_colab():
+        # Colab-first default: keep active runs on local SSD for speed; copy final artifacts out if desired.
+        return Path("/content") / "ME-IIS" / "outputs" / "runs"
     persist_root = resolve_persist_root()
     if persist_root is not None:
         return Path(persist_root) / "outputs" / "runs"
@@ -76,12 +80,17 @@ class RunConfig:
     source_domain: str
     target_domain: str
 
-    method: str  # e.g. "source_only", "me_iis", "dann", "coral", "pseudo_label"
+    method: str  # e.g. "source_only", "dann", "dan", "jan", "cdan", "me_iis", "pseudo_label"
 
     backbone: str = "resnet50"
     backbone_pretrained: bool = True
     input_size: int = 224
     transforms_id: str = "domain_loaders_v1"
+
+    bottleneck_dim: int = 256
+    bottleneck_bn: bool = True
+    bottleneck_relu: bool = True
+    bottleneck_dropout: float = 0.0
 
     optimizer: str = "sgd"
     momentum: float = 0.9
@@ -96,7 +105,7 @@ class RunConfig:
     lr_backbone: float = 1e-3
     lr_classifier: float = 1e-2
 
-    finetune_backbone: bool = False
+    finetune_backbone: bool = True
     backbone_lr_scale: float = 0.1
     classifier_lr: float = 1e-2
 

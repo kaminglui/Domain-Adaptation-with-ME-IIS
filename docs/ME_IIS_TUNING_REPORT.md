@@ -61,9 +61,8 @@ The committed notebook output in `notebooks/Run_All_Experiments.ipynb` contains,
 | `source_only` | 0 | 78.038731 | 30.148912 | f2fc29f097 |
 | `me_iis` | 0 | 76.967450 | 28.568156 | d3b3fbdc39 |
 | `dann` | 0 | 80.428513 | 33.127148 | ab83d40821 |
-| `coral` | 0 | 80.428513 | 33.127148 | ffc0b32a86 |
 
-In that table, ME-IIS (`me_iis`) is lower than source-only and lower than DANN/CORAL for that single reported seed.
+In that table, ME-IIS (`me_iis`) is lower than source-only and lower than DANN for that single reported seed.
 
 ### (2) Colab notebook: repeated failures with CUDA “device-side assert”
 The notebook output also shows multiple run attempts failing with:
@@ -107,4 +106,3 @@ Keep fixed across all configs:
 Logging recommendation for the sweep:
 - Use the unified runner (as in the notebook) so each config has a deterministic `run_id` and a per-run `metrics.csv`.
 - Export one aggregated CSV via the notebook export cell (writes `outputs/runs/{dataset_tag}/{src}2{tgt}/all_metrics.csv`) which includes `run_id` and `method_params_json`.
-

@@ -51,6 +51,7 @@ class MaxEntAdapter:
         gmm_selection_mode: str = "fixed",
         gmm_bic_min_components: int = 2,
         gmm_bic_max_components: int = 8,
+        gmm_reg_covar: float = 1e-6,
         cluster_backend: str = "gmm",
         vmf_kappa: float = 20.0,
         cluster_clean_ratio: float = 1.0,
@@ -64,6 +65,7 @@ class MaxEntAdapter:
         self.gmm_selection_mode = gmm_selection_mode
         self.gmm_bic_min_components = gmm_bic_min_components
         self.gmm_bic_max_components = gmm_bic_max_components
+        self.gmm_reg_covar = float(gmm_reg_covar)
         self.cluster_backend = cluster_backend
         self.vmf_kappa = vmf_kappa
         self.cluster_clean_ratio = cluster_clean_ratio
@@ -91,6 +93,7 @@ class MaxEntAdapter:
             gmm_selection_mode=self.gmm_selection_mode,
             gmm_bic_min_components=self.gmm_bic_min_components,
             gmm_bic_max_components=self.gmm_bic_max_components,
+            gmm_reg_covar=self.gmm_reg_covar,
             kmeans_n_init=self.kmeans_n_init,
             vmf_kappa=self.vmf_kappa,
         )

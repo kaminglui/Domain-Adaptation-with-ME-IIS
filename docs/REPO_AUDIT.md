@@ -54,7 +54,6 @@ This document is a factual inspection of the current repository code paths (no a
 - `src/experiments/methods/source_only.py`: unified source-only training with deterministic run directories + checkpoints.
 - `src/experiments/methods/me_iis.py`: ME-IIS adaptation implemented with the unified checkpointing/run_id system.
 - `src/experiments/methods/dann.py`: DANN adaptation implemented with the unified checkpointing/run_id system.
-- `src/experiments/methods/coral.py`: CORAL adaptation implemented with the unified checkpointing/run_id system.
 - `src/experiments/methods/pseudo_label.py`: pseudo-label self-training baseline implemented with the unified checkpointing/run_id system.
 
 ### Tests

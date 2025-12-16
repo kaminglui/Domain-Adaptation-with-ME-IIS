@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from datasets.domain_loaders import get_domain_loaders
 from eval import evaluate
@@ -25,9 +25,9 @@ from src.experiments.checkpointing import (
     save_checkpoint,
     save_state,
 )
-from src.experiments.data import DropLabelsDataset
+from src.experiments.data import DropLabelsDataset, assert_labels_dropped
 from src.experiments.loss_checks import safe_cross_entropy
-from src.experiments.pseudo_labeling import PseudoLabeledDataset, build_pseudo_labels
+from src.experiments.losses import mmd_loss
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.run_config import RunConfig, get_run_dir, save_config
 from src.experiments.signature import hash_model_state, write_signature
@@ -43,15 +43,6 @@ from utils.resource_utils import (
 from utils.seed_utils import get_device, set_seed
 
 
-def _infer_num_classes(dataset: Dataset) -> int:
-    base = dataset
-    while hasattr(base, "dataset"):
-        base = base.dataset  # type: ignore[attr-defined]
-    if hasattr(base, "classes"):
-        return len(base.classes)  # type: ignore[attr-defined]
-    raise ValueError("Unable to infer number of classes from dataset.")
-
-
 def _grad_norm(module: nn.Module) -> float:
     total_sq = 0.0
     for p in module.parameters():
@@ -60,94 +51,6 @@ def _grad_norm(module: nn.Module) -> float:
         g = p.grad.detach()
         total_sq += float(g.norm(2).item()) ** 2
     return float(total_sq**0.5)
-
-
-def _adapt_epoch(
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    source_loader: DataLoader,
-    device: torch.device,
-    *,
-    amp_enabled: bool,
-    scaler: Optional[torch.cuda.amp.GradScaler],
-    max_batches: int = 0,
-    pseudo_loader: Optional[DataLoader] = None,
-    pseudo_loss_weight: float = 1.0,
-) -> Dict[str, float]:
-    model.train()
-    pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
-
-    total_loss_sum = 0.0
-    total_src = 0
-    total_acc = 0.0
-    batches_seen = 0
-    pseudo_used = 0
-    pseudo_total = len(pseudo_loader.dataset) if pseudo_loader is not None else 0
-
-    for images, labels in source_loader:
-        if max_batches > 0 and batches_seen >= max_batches:
-            break
-        images = images.to(device)
-        labels = labels.to(device)
-
-        pseudo_batch = None
-        if pseudo_iter is not None:
-            try:
-                pseudo_batch = next(pseudo_iter)
-            except StopIteration:
-                pseudo_iter = None
-                pseudo_batch = None
-
-        optimizer.zero_grad(set_to_none=True)
-        pseudo_loss = torch.tensor(0.0, device=device)
-        pseudo_bs = 0
-        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
-            logits, _ = model(images, return_features=False)
-            loss_src = safe_cross_entropy(logits, labels, num_classes=int(logits.shape[1]))
-
-            if pseudo_batch is not None:
-                images_tgt, labels_tgt = pseudo_batch
-                images_tgt = images_tgt.to(device)
-                labels_tgt = labels_tgt.to(device)
-                logits_tgt, _ = model(images_tgt, return_features=False)
-                pseudo_loss = safe_cross_entropy(logits_tgt, labels_tgt, num_classes=int(logits_tgt.shape[1]))
-                pseudo_bs = labels_tgt.size(0)
-                pseudo_used += pseudo_bs
-
-            loss = loss_src + float(pseudo_loss_weight) * pseudo_loss
-
-        if amp_enabled:
-            if scaler is None:
-                raise RuntimeError("AMP enabled but GradScaler is None.")
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
-
-        bs = labels.size(0)
-        loss_src_value = float(loss_src.detach().item())
-        total_loss_sum += loss_src_value * bs
-        pseudo_loss_value = float(pseudo_loss.detach().item()) if pseudo_bs > 0 else 0.0
-        if pseudo_bs > 0:
-            total_loss_sum += float(pseudo_loss_weight) * pseudo_loss_value * pseudo_bs
-
-        acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
-        total_acc += acc * bs
-        total_src += bs
-        batches_seen += 1
-
-    denom = total_src + pseudo_used if (pseudo_loader is not None and (total_src + pseudo_used) > 0) else total_src
-    avg_loss = total_loss_sum / denom if denom > 0 else 0.0
-    avg_src_acc = total_acc / total_src if total_src > 0 else 0.0
-    return {
-        "loss": float(avg_loss),
-        "source_acc": float(avg_src_acc),
-        "batches_seen": float(batches_seen),
-        "pseudo_used": float(pseudo_used),
-        "pseudo_total": float(pseudo_total),
-    }
 
 
 def run(
@@ -179,12 +82,10 @@ def run(
 
     set_seed(config.seed, deterministic=config.deterministic)
     device = get_device(deterministic=config.deterministic)
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
     data_generator = make_generator(config.seed)
     worker_init = make_worker_init_fn(config.seed)
 
-    source_loader, _target_loader_train, target_eval_loader = get_domain_loaders(
+    source_loader, target_loader, target_eval_loader = get_domain_loaders(
         dataset_name=config.dataset_name,
         source_domain=config.source_domain,
         target_domain=config.target_domain,
@@ -196,40 +97,17 @@ def run(
         generator=data_generator,
         worker_init_fn=worker_init,
     )
+
     source_train_ds: Dataset = source_loader.dataset
+    target_train_ds: Dataset = DropLabelsDataset(target_loader.dataset)
     target_eval_ds: Dataset = target_eval_loader.dataset
 
-    source_loader = build_loader(
-        source_train_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        seed=config.seed,
-        generator=data_generator,
-        drop_last=False,
-    )
-    target_eval_loader = build_loader(
-        target_eval_ds,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        seed=config.seed,
-        generator=data_generator,
-        drop_last=False,
-    )
+    num_classes = None
+    if hasattr(source_train_ds, "classes"):
+        num_classes = len(source_train_ds.classes)  # type: ignore[attr-defined]
+    if num_classes is None:
+        raise ValueError("Unable to infer num_classes for DAN from source dataset.")
 
-    target_feat_ds: Dataset = DropLabelsDataset(target_eval_ds)
-    target_feat_loader = build_loader(
-        target_feat_ds,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        seed=config.seed,
-        generator=data_generator,
-        drop_last=False,
-    )
-
-    num_classes = _infer_num_classes(source_train_ds)
     model = build_model(
         num_classes=int(num_classes),
         pretrained=config.backbone_pretrained,
@@ -238,6 +116,7 @@ def run(
         bottleneck_relu=bool(config.bottleneck_relu),
         bottleneck_dropout=float(config.bottleneck_dropout),
     ).to(device)
+
     source_ckpt = torch.load(source_checkpoint, map_location=device)
     model.backbone.load_state_dict(source_ckpt["backbone"])
     model.bottleneck.load_state_dict(source_ckpt["bottleneck"])
@@ -246,24 +125,30 @@ def run(
     amp_enabled = bool(config.method_params.get("amp", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
+    mmd_weight = float(config.method_params.get("mmd_loss_weight", 1.0))
+    kernel_mul = float(config.method_params.get("mmd_kernel_mul", 2.0))
+    kernel_num = int(config.method_params.get("mmd_kernel_num", 5))
+    fix_sigma_raw = config.method_params.get("mmd_fix_sigma")
+    fix_sigma = None if fix_sigma_raw is None else float(fix_sigma_raw)
+
     loss_terms_enabled = {
         "cls": True,
         "domain_adv": False,
-        "mmd": False,
+        "mmd": True,
         "jmmd": False,
         "cdan": False,
         "iis": False,
-        "pseudo": True,
+        "pseudo": False,
     }
     signature = {
         "method_name": config.method,
         "source_checkpoint": str(Path(source_checkpoint)),
         "method_params_used": {
             "amp": bool(amp_enabled),
-            "pseudo_conf_thresh": float(config.method_params.get("pseudo_conf_thresh", 0.9)),
-            "pseudo_max_ratio": float(config.method_params.get("pseudo_max_ratio", 1.0)),
-            "pseudo_loss_weight": float(config.method_params.get("pseudo_loss_weight", 1.0)),
-            "pseudo_ignore_index": int(config.method_params.get("pseudo_ignore_index", -100)),
+            "mmd_loss_weight": float(mmd_weight),
+            "mmd_kernel_mul": float(kernel_mul),
+            "mmd_kernel_num": int(kernel_num),
+            "mmd_fix_sigma": fix_sigma,
             **({"one_batch_debug": True} if bool(config.method_params.get("one_batch_debug", False)) else {}),
         },
         "loss_terms_enabled": loss_terms_enabled,
@@ -305,7 +190,7 @@ def run(
         )
         if dl_tuning.batch_size != config.batch_size or dl_tuning.num_workers != config.num_workers:
             print(
-                f"[AUTO_RESOURCES] pseudo_label: batch_size {config.batch_size}->{dl_tuning.batch_size}, "
+                f"[AUTO_RESOURCES] dan: batch_size {config.batch_size}->{dl_tuning.batch_size}, "
                 f"num_workers {config.num_workers}->{dl_tuning.num_workers} "
                 f"(GPU free={format_bytes(resources.cuda_free_bytes)} disk_free={format_bytes(resources.disk_free_bytes)})"
             )
@@ -335,18 +220,18 @@ def run(
         drop_last=False,
         **loader_kwargs,
     )
-    target_eval_loader = build_loader(
-        target_eval_ds,
+    target_loader = build_loader(
+        target_train_ds,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
         **loader_kwargs,
     )
-    target_feat_loader = build_loader(
-        target_feat_ds,
+    target_eval_loader = build_loader(
+        target_eval_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -361,8 +246,7 @@ def run(
         epochs_source=int(config.epochs_source),
         epochs_adapt=int(config.epochs_adapt),
         source_batches_per_epoch=int(len(source_loader)),
-        target_batches_per_epoch=int(len(target_feat_loader)),
-        adapt_steps_per_epoch_override=int(len(source_loader)),
+        target_batches_per_epoch=int(len(target_loader)),
     )
     print(
         "[BUDGET] "
@@ -405,134 +289,6 @@ def run(
     optimizer = optim.SGD(groups, momentum=config.momentum, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(config.epochs_adapt)))
 
-    conf_thresh = float(config.method_params.get("pseudo_conf_thresh", 0.9))
-    max_ratio = float(config.method_params.get("pseudo_max_ratio", 1.0))
-    pseudo_loss_weight = float(config.method_params.get("pseudo_loss_weight", 1.0))
-
-    one_batch_debug = bool(config.method_params.get("one_batch_debug", False))
-    if one_batch_debug:
-        ignore_index = int(config.method_params.get("pseudo_ignore_index", -100))
-        model.train()
-        x_s, y_s = next(iter(source_loader))
-        x_t, y_t = next(iter(target_feat_loader))
-        if torch.is_tensor(y_t):
-            if not bool((y_t.to(dtype=torch.long) == -1).all().item()):
-                raise RuntimeError("Target labels unexpectedly present in pseudo_label one-batch debug.")
-
-        x_s = x_s.to(device)
-        y_s = y_s.to(device)
-        x_t = x_t.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
-            logits_s, _ = model(x_s, return_features=False)
-            cls_loss = safe_cross_entropy(logits_s, y_s, num_classes=int(logits_s.shape[1]))
-
-        with torch.no_grad():
-            with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
-                logits_t_ng, _ = model(x_t, return_features=False)
-            probs = F.softmax(logits_t_ng.float(), dim=1)
-            max_prob, pred = probs.max(dim=1)
-            pseudo_labels = pred.to(dtype=torch.long)
-            keep = max_prob >= float(conf_thresh)
-            pseudo_labels = torch.where(keep, pseudo_labels, torch.full_like(pseudo_labels, ignore_index))
-            pseudo_keep = int(keep.sum().item())
-
-        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
-            logits_t, _ = model(x_t, return_features=False)
-            pseudo_loss = safe_cross_entropy(
-                logits_t,
-                pseudo_labels,
-                num_classes=int(logits_t.shape[1]),
-                ignore_index=int(ignore_index),
-            )
-
-        loss = cls_loss + float(pseudo_loss_weight) * pseudo_loss
-        if not torch.isfinite(loss).all().item():
-            raise RuntimeError("Non-finite loss encountered in one-batch debug.")
-        if amp_enabled:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        gn_backbone = _grad_norm(model.backbone)
-        gn_bottleneck = _grad_norm(model.bottleneck)
-        gn_head = _grad_norm(model.classifier)
-        if amp_enabled:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        src_acc = float((torch.argmax(logits_s, dim=1) == y_s).float().mean().item() * 100.0)
-
-        print(
-            "[ONE_BATCH_DEBUG] pseudo_label "
-            f"cls_loss={float(cls_loss.item()):.6f} pseudo_loss={float(pseudo_loss.item()):.6f} "
-            f"pseudo_keep={pseudo_keep}/{int(pseudo_labels.numel())} conf_thresh={float(conf_thresh):.3f} "
-            f"grad_norm_backbone={gn_backbone:.6f} grad_norm_bottleneck={gn_bottleneck:.6f} grad_norm_head={gn_head:.6f}"
-        )
-        return {
-            "status": "one_batch_debug",
-            "run_dir": str(run_dir),
-            "cls_loss": float(cls_loss.item()),
-            "pseudo_loss": float(pseudo_loss.item()),
-            "pseudo_keep": int(pseudo_keep),
-            "pseudo_total": int(pseudo_labels.numel()),
-            "conf_thresh": float(conf_thresh),
-            "ignore_index": int(ignore_index),
-            "grad_norm_backbone": float(gn_backbone),
-            "grad_norm_bottleneck": float(gn_bottleneck),
-            "grad_norm_head": float(gn_head),
-            "source_acc_batch": float(src_acc),
-        }
-
-    pseudo_indices, pseudo_labels = build_pseudo_labels(
-        model=model,
-        target_loader=target_feat_loader,
-        device=device,
-        conf_thresh=conf_thresh,
-        max_ratio=max_ratio,
-        num_source_samples=len(source_train_ds),
-    )
-    if len(pseudo_indices) != len(pseudo_labels):
-        raise RuntimeError("Pseudo-labeling returned mismatched indices/labels lengths.")
-    if pseudo_indices:
-        min_idx = min(int(i) for i in pseudo_indices)
-        max_idx = max(int(i) for i in pseudo_indices)
-        if min_idx < 0 or max_idx >= len(target_feat_ds):
-            raise ValueError(
-                "Pseudo-label indices out of range for target dataset: "
-                f"[{min_idx}, {max_idx}] vs dataset size {len(target_feat_ds)}"
-            )
-    if pseudo_labels:
-        min_label = min(int(l) for l in pseudo_labels)
-        max_label = max(int(l) for l in pseudo_labels)
-        if min_label < 0 or max_label >= int(num_classes):
-            raise ValueError(
-                "Pseudo-label class ids out of range: "
-                f"[{min_label}, {max_label}] vs num_classes={int(num_classes)}"
-            )
-    print(
-        f"[pseudo_label] pseudo_count={len(pseudo_indices)} conf_thresh={conf_thresh} "
-        f"max_ratio={max_ratio} pseudo_loss_weight={pseudo_loss_weight}"
-    )
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    pseudo_loader: Optional[DataLoader] = None
-    if len(pseudo_indices) > 0:
-        pseudo_ds = PseudoLabeledDataset(target_feat_loader.dataset, pseudo_indices, pseudo_labels)
-        pseudo_loader = build_loader(
-            pseudo_ds,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            seed=config.seed,
-            generator=data_generator,
-            drop_last=False,
-            **loader_kwargs,
-        )
-
     start_epoch = 0
     last_completed_epoch = -1
     scheduler_loaded = False
@@ -568,6 +324,67 @@ def run(
         for _ in range(start_epoch):
             scheduler.step()
 
+    one_batch_debug = bool(config.method_params.get("one_batch_debug", False))
+    if one_batch_debug:
+        model.train()
+        (x_s, y_s) = next(iter(source_loader))
+        (x_t, y_t) = next(iter(target_loader))
+        assert_labels_dropped(y_t, label_value=-1)
+
+        x_s = x_s.to(device)
+        y_s = y_s.to(device)
+        x_t = x_t.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+            logits_s, feats_s = model(x_s, return_features=True)
+            _logits_t, feats_t = model(x_t, return_features=True)
+            if feats_s is None or feats_t is None:
+                raise RuntimeError("Model did not return features for DAN (one-batch debug).")
+
+            cls_loss = safe_cross_entropy(logits_s, y_s, num_classes=int(logits_s.shape[1]))
+            align_loss = mmd_loss(
+                feats_s.float(),
+                feats_t.float(),
+                kernel_mul=kernel_mul,
+                kernel_num=kernel_num,
+                fix_sigma=fix_sigma,
+            )
+            loss = cls_loss + float(mmd_weight) * align_loss
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        gn_backbone = _grad_norm(model.backbone)
+        gn_bottleneck = _grad_norm(model.bottleneck)
+        gn_head = _grad_norm(model.classifier)
+        if amp_enabled:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        src_acc = float((torch.argmax(logits_s, dim=1) == y_s).float().mean().item() * 100.0)
+
+        print(
+            "[ONE_BATCH_DEBUG] dan "
+            f"cls_loss={float(cls_loss.item()):.6f} mmd={float(align_loss.item()):.6f} "
+            f"mmd_weight={float(mmd_weight):.3f} src_acc={src_acc:.3f} "
+            f"grad_norm_backbone={gn_backbone:.6f} grad_norm_bottleneck={gn_bottleneck:.6f} grad_norm_head={gn_head:.6f}"
+        )
+        return {
+            "status": "one_batch_debug",
+            "run_dir": str(run_dir),
+            "cls_loss": float(cls_loss.item()),
+            "mmd_loss": float(align_loss.item()),
+            "mmd_weight": float(mmd_weight),
+            "source_acc_batch": float(src_acc),
+            "grad_norm_backbone": float(gn_backbone),
+            "grad_norm_bottleneck": float(gn_bottleneck),
+            "grad_norm_head": float(gn_head),
+        }
+
     total_epochs = int(config.epochs_adapt)
     for epoch in range(start_epoch, total_epochs):
         remaining_batches = 0
@@ -576,22 +393,72 @@ def run(
             if remaining_batches == 0:
                 break
 
-        stats = _adapt_epoch(
-            model=model,
-            optimizer=optimizer,
-            source_loader=source_loader,
-            device=device,
-            amp_enabled=bool(amp_enabled),
-            scaler=scaler,
-            max_batches=remaining_batches,
-            pseudo_loader=pseudo_loader,
-            pseudo_loss_weight=pseudo_loss_weight,
-        )
-        adapt_batches_seen += int(stats["batches_seen"])
+        model.train()
+        epoch_loss = 0.0
+        epoch_cls = 0.0
+        epoch_mmd = 0.0
+        epoch_src_acc = 0.0
+        epoch_batches = 0
+
+        for (x_s, y_s), (x_t, y_t) in zip(source_loader, target_loader):
+            if remaining_batches > 0 and epoch_batches >= remaining_batches:
+                break
+            assert_labels_dropped(y_t, label_value=-1)
+
+            x_s = x_s.to(device)
+            y_s = y_s.to(device)
+            x_t = x_t.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+                logits_s, feats_s = model(x_s, return_features=True)
+                _logits_t, feats_t = model(x_t, return_features=True)
+                if feats_s is None or feats_t is None:
+                    raise RuntimeError("Model did not return features for DAN.")
+
+                cls_loss = safe_cross_entropy(logits_s, y_s, num_classes=int(logits_s.shape[1]))
+                align_loss = mmd_loss(
+                    feats_s.float(),
+                    feats_t.float(),
+                    kernel_mul=kernel_mul,
+                    kernel_num=kernel_num,
+                    fix_sigma=fix_sigma,
+                )
+                loss = cls_loss + float(mmd_weight) * align_loss
+
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            with torch.no_grad():
+                src_acc_step = float((torch.argmax(logits_s, dim=1) == y_s).float().mean().item() * 100.0)
+            epoch_src_acc += src_acc_step
+            epoch_loss += float(loss.item())
+            epoch_cls += float(cls_loss.item())
+            epoch_mmd += float(align_loss.item())
+            epoch_batches += 1
+            adapt_batches_seen += 1
+
+            if config.dry_run_max_batches > 0 and adapt_batches_seen >= config.dry_run_max_batches:
+                break
+
         scheduler.step()
         tgt_acc, _ = evaluate(model, target_eval_loader, device)
         last_completed_epoch = epoch
-        src_acc = float(stats["source_acc"])
+
+        denom = max(1, epoch_batches)
+        avg_loss = epoch_loss / denom
+        avg_cls = epoch_cls / denom
+        avg_mmd = epoch_mmd / denom
+        avg_src_acc = epoch_src_acc / denom
+        print(
+            f"[DAN] epoch={epoch + 1}/{total_epochs} "
+            f"loss={avg_loss:.6f} mmd={avg_mmd:.6f} mmd_weight={float(mmd_weight):.3f}"
+        )
 
         ckpt_payload: Dict[str, Any] = {
             "backbone": model.backbone.state_dict(),
@@ -603,15 +470,17 @@ def run(
             "epoch": last_completed_epoch,
             "num_epochs": total_epochs,
             "adapt_batches_seen": adapt_batches_seen,
-            "source_acc": float(src_acc),
+            "source_acc": float(avg_src_acc),
             "target_acc": float(tgt_acc),
             "completed": False,
             "config": asdict(config),
-            "pseudo_conf_thresh": float(conf_thresh),
-            "pseudo_max_ratio": float(max_ratio),
-            "pseudo_loss_weight": float(pseudo_loss_weight),
-            "pseudo_count": int(len(pseudo_indices)),
-            "loss": float(stats["loss"]),
+            "loss": float(avg_loss),
+            "cls_loss": float(avg_cls),
+            "mmd_loss": float(avg_mmd),
+            "mmd_loss_weight": float(mmd_weight),
+            "mmd_kernel_mul": float(kernel_mul),
+            "mmd_kernel_num": int(kernel_num),
+            "mmd_fix_sigma": fix_sigma,
         }
         save_checkpoint(artifacts.last_checkpoint_path, ckpt_payload)
         if save_every_epochs > 0 and (epoch + 1) % save_every_epochs == 0:
@@ -646,7 +515,6 @@ def run(
         "source_acc": float(src_acc),
         "completed": True,
         "config": asdict(config),
-        "pseudo_count": int(len(pseudo_indices)),
     }
     save_checkpoint(artifacts.final_checkpoint_path, ckpt_final)
     save_state(
@@ -670,5 +538,4 @@ def run(
         "checkpoint": str(artifacts.final_checkpoint_path),
         "completed": bool(state.completed) if state else True,
         "epoch": int(last_completed_epoch),
-        "pseudo_count": int(len(pseudo_indices)),
     }

@@ -23,7 +23,7 @@ class RunArtifacts:
     run_dir: Path
     run_id: str
     stage: str  # e.g. "source" | "adapt"
-    method: str  # e.g. "source_only" | "me_iis" | "dann" | "coral" | "pseudo_label"
+    method: str  # e.g. "source_only" | "dann" | "dan" | "jan" | "cdan" | "me_iis" | "pseudo_label"
 
     @property
     def config_path(self) -> Path:
@@ -63,4 +63,3 @@ class RunArtifacts:
 
     def epoch_checkpoint_path(self, epoch_1based: int) -> Path:
         return self.checkpoints_dir / f"{self.stage}_{self.method}_{self.run_id}_epoch{int(epoch_1based)}.pth"
-

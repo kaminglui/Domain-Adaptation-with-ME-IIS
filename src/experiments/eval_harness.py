@@ -81,11 +81,24 @@ def evaluate_checkpoint(
         seed=seed,
     )
     num_classes = _infer_num_classes(loader)
-    model = build_model(num_classes=num_classes, pretrained=False).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    if "backbone" not in ckpt or "classifier" not in ckpt:
-        raise RuntimeError("Checkpoint missing 'backbone' and/or 'classifier' keys.")
+    if "backbone" not in ckpt or "bottleneck" not in ckpt or "classifier" not in ckpt:
+        raise RuntimeError("Checkpoint missing 'backbone', 'bottleneck', and/or 'classifier' keys.")
+
+    bottleneck_state = ckpt["bottleneck"]
+    bottleneck_dim = None
+    if isinstance(bottleneck_state, dict):
+        w = bottleneck_state.get("fc.weight")
+        if w is None:
+            w = bottleneck_state.get("weight")
+        if torch.is_tensor(w) and w.ndim == 2:
+            bottleneck_dim = int(w.shape[0])
+    if bottleneck_dim is None:
+        raise RuntimeError("Unable to infer bottleneck_dim from checkpoint.")
+
+    model = build_model(num_classes=num_classes, pretrained=False, bottleneck_dim=bottleneck_dim).to(device)
     model.backbone.load_state_dict(ckpt["backbone"], strict=False)
+    model.bottleneck.load_state_dict(ckpt["bottleneck"], strict=False)
     model.classifier.load_state_dict(ckpt["classifier"], strict=False)
     acc, _ = evaluate(model, loader, device)
     return float(acc)
@@ -123,4 +136,3 @@ def evaluate_source_and_target(
         deterministic=deterministic,
     )
     return source_acc, target_acc
-

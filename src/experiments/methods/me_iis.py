@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +18,7 @@ from datasets.domain_loaders import get_domain_loaders
 from eval import evaluate
 from models.classifier import build_model
 from models.me_iis_adapter import IISIterationStats, MaxEntAdapter
+from src.experiments.budget import compute_step_budget
 from src.experiments.checkpointing import (
     RunState,
     ensure_run_dirs,
@@ -27,9 +30,11 @@ from src.experiments.checkpointing import (
     save_state,
 )
 from src.experiments.data import DropLabelsDataset
+from src.experiments.loss_checks import safe_cross_entropy
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.run_config import RunConfig, get_run_dir, save_config
 from src.experiments.pseudo_labeling import PseudoLabeledDataset, build_pseudo_labels
+from src.experiments.signature import hash_model_state, write_signature
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.experiment_utils import build_components_map, parse_feature_layers
 from utils.feature_utils import extract_features
@@ -77,12 +82,25 @@ def _class_probs_from_logits(
     raise ValueError(f"Unknown source_prob_mode '{mode}'")
 
 
+def _grad_norm(module: nn.Module) -> float:
+    total_sq = 0.0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total_sq += float(g.norm(2).item()) ** 2
+    return float(total_sq**0.5)
+
+
 def adapt_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
     source_loader: DataLoader,
     source_weights_vec: torch.Tensor,
     device: torch.device,
+    *,
+    amp_enabled: bool,
+    scaler: Optional[torch.cuda.amp.GradScaler],
     max_batches: int = 0,
     pseudo_loader: Optional[DataLoader] = None,
     pseudo_loss_weight: float = 1.0,
@@ -109,25 +127,34 @@ def adapt_epoch(
                 pseudo_iter = None
                 pseudo_batch = None
 
-        optimizer.zero_grad()
-        logits, _ = model(images, return_features=False)
-        ce = F.cross_entropy(logits, labels, reduction="none")
-        loss_src = (batch_weights * ce).sum() / (batch_weights.sum() + 1e-8)
-
+        optimizer.zero_grad(set_to_none=True)
         pseudo_loss = torch.tensor(0.0, device=device)
         pseudo_bs = 0
-        if pseudo_batch is not None:
-            images_tgt, labels_tgt = pseudo_batch
-            images_tgt = images_tgt.to(device)
-            labels_tgt = labels_tgt.to(device)
-            logits_tgt, _ = model(images_tgt, return_features=False)
-            pseudo_loss = F.cross_entropy(logits_tgt, labels_tgt)
-            pseudo_bs = labels_tgt.size(0)
-            pseudo_used += pseudo_bs
+        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+            logits, _ = model(images, return_features=False)
+            ce = safe_cross_entropy(logits, labels, num_classes=int(logits.shape[1]), reduction="none")
+            loss_src = (batch_weights * ce).sum() / (batch_weights.sum() + 1e-8)
 
-        loss = loss_src + pseudo_loss_weight * pseudo_loss
-        loss.backward()
-        optimizer.step()
+            if pseudo_batch is not None:
+                images_tgt, labels_tgt = pseudo_batch
+                images_tgt = images_tgt.to(device)
+                labels_tgt = labels_tgt.to(device)
+                logits_tgt, _ = model(images_tgt, return_features=False)
+                pseudo_loss = safe_cross_entropy(logits_tgt, labels_tgt, num_classes=int(logits_tgt.shape[1]))
+                pseudo_bs = labels_tgt.size(0)
+                pseudo_used += pseudo_bs
+
+            loss = loss_src + float(pseudo_loss_weight) * pseudo_loss
+
+        if amp_enabled:
+            if scaler is None:
+                raise RuntimeError("AMP enabled but GradScaler is None.")
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         bs = labels.size(0)
         acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
@@ -168,7 +195,7 @@ def run(
     source_checkpoint: Path,
     force_rerun: bool = False,
     runs_root: Optional[Path] = None,
-    save_every_epochs: int = 1,
+    save_every_epochs: int = 0,
 ) -> Dict[str, Any]:
     run_dir = get_run_dir(config, runs_root=runs_root)
     artifacts = RunArtifacts(run_dir=run_dir, run_id=config.run_id, stage="adapt", method=config.method)
@@ -245,14 +272,25 @@ def run(
         target_feat_ds = target_feat_raw
 
     num_classes = _num_classes_from_dataset(source_train_ds)
-    model = build_model(num_classes=num_classes, pretrained=config.backbone_pretrained).to(device)
+    model = build_model(
+        num_classes=num_classes,
+        pretrained=config.backbone_pretrained,
+        bottleneck_dim=int(config.bottleneck_dim),
+        bottleneck_bn=bool(config.bottleneck_bn),
+        bottleneck_relu=bool(config.bottleneck_relu),
+        bottleneck_dropout=float(config.bottleneck_dropout),
+    ).to(device)
     source_ckpt = torch.load(source_checkpoint, map_location=device)
     model.backbone.load_state_dict(source_ckpt["backbone"])
+    model.bottleneck.load_state_dict(source_ckpt["bottleneck"])
     model.classifier.load_state_dict(source_ckpt["classifier"])
 
     if not config.finetune_backbone:
         for p in model.backbone.parameters():
             p.requires_grad = False
+
+    amp_enabled = bool(config.method_params.get("amp", True)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     resources = detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0))
     if auto_resources_enabled(default=False):
@@ -335,6 +373,7 @@ def run(
     gmm_selection_mode = str(config.method_params.get("gmm_selection_mode", "fixed"))
     gmm_bic_min = int(config.method_params.get("gmm_bic_min_components", 2))
     gmm_bic_max = int(config.method_params.get("gmm_bic_max_components", 8))
+    gmm_reg_covar = float(config.method_params.get("gmm_reg_covar", 1e-6))
     vmf_kappa = float(config.method_params.get("vmf_kappa", 20.0))
     cluster_clean_ratio = float(config.method_params.get("cluster_clean_ratio", 1.0))
     kmeans_n_init = int(config.method_params.get("kmeans_n_init", 10))
@@ -343,6 +382,96 @@ def run(
     pseudo_conf_thresh = float(config.method_params.get("pseudo_conf_thresh", 0.9))
     pseudo_max_ratio = float(config.method_params.get("pseudo_max_ratio", 1.0))
     pseudo_loss_weight = float(config.method_params.get("pseudo_loss_weight", 1.0))
+    weight_clip_max_raw = config.method_params.get("weight_clip_max")
+    weight_clip_max = None if weight_clip_max_raw is None else float(weight_clip_max_raw)
+    weight_mix_alpha = float(config.method_params.get("weight_mix_alpha", 0.0))
+
+    source_batches_per_epoch = int((len(source_train_ds) + batch_size - 1) // batch_size)
+    target_batches_per_epoch = int((len(target_feat_ds) + batch_size - 1) // batch_size)
+    budget = compute_step_budget(
+        method=str(config.method),
+        epochs_source=int(config.epochs_source),
+        epochs_adapt=int(config.epochs_adapt),
+        source_batches_per_epoch=int(source_batches_per_epoch),
+        target_batches_per_epoch=int(target_batches_per_epoch),
+    )
+    epoch_step_cap = int(budget.adapt_steps_per_epoch)
+    print(
+        "[BUDGET] "
+        f"source_batches/epoch={int(budget.source_batches_per_epoch)} "
+        f"target_batches/epoch={int(budget.target_batches_per_epoch)} "
+        f"adapt_steps/epoch={int(budget.adapt_steps_per_epoch)} "
+        f"steps_total={int(budget.steps_total)}"
+    )
+
+    loss_terms_enabled = {
+        "cls": True,
+        "domain_adv": False,
+        "mmd": False,
+        "jmmd": False,
+        "cdan": False,
+        "iis": True,
+        "pseudo": bool(use_pseudo_labels),
+    }
+    signature = {
+        "method_name": config.method,
+        "source_checkpoint": str(Path(source_checkpoint)),
+        "method_params_used": {
+            "amp": bool(amp_enabled),
+            "feature_layers": list(feature_layers),
+            "num_latent_styles": int(config.method_params.get("num_latent_styles", 5)),
+            "components_per_layer": config.method_params.get("components_per_layer"),
+            "source_prob_mode": str(source_prob_mode),
+            "iis_iters": int(iis_iters),
+            "iis_tol": float(iis_tol),
+            "cluster_backend": str(cluster_backend),
+            "gmm_selection_mode": str(gmm_selection_mode),
+            "gmm_bic_min_components": int(gmm_bic_min),
+            "gmm_bic_max_components": int(gmm_bic_max),
+            "gmm_reg_covar": float(gmm_reg_covar),
+            "vmf_kappa": float(vmf_kappa),
+            "cluster_clean_ratio": float(cluster_clean_ratio),
+            "kmeans_n_init": int(kmeans_n_init),
+            "use_pseudo_labels": bool(use_pseudo_labels),
+            "pseudo_conf_thresh": float(pseudo_conf_thresh),
+            "pseudo_max_ratio": float(pseudo_max_ratio),
+            "pseudo_loss_weight": float(pseudo_loss_weight),
+            "weight_clip_max": weight_clip_max,
+            "weight_mix_alpha": float(weight_mix_alpha),
+            **({"one_batch_debug": True} if bool(config.method_params.get("one_batch_debug", False)) else {}),
+        },
+        "loss_terms_enabled": loss_terms_enabled,
+        "model_components": {
+            "backbone": type(model.backbone).__name__,
+            "bottleneck": type(model.bottleneck).__name__,
+            "bottleneck_dim": int(config.bottleneck_dim),
+            "classifier": type(model.classifier).__name__,
+            "domain_discriminator_present": False,
+        },
+        "dataloader": {
+            "batch_size": int(batch_size),
+            "num_workers": int(num_workers),
+            **{k: v for k, v in loader_kwargs.items() if v is not None},
+        },
+        "step_budget": {
+            "source_batches_per_epoch": int(budget.source_batches_per_epoch),
+            "target_batches_per_epoch": int(budget.target_batches_per_epoch),
+            "adapt_steps_per_epoch": int(budget.adapt_steps_per_epoch),
+            "steps_source": int(budget.steps_source),
+            "steps_adapt": int(budget.steps_adapt),
+            "steps_total": int(budget.steps_total),
+        },
+        "model_state_hash": hash_model_state(model),
+    }
+    write_signature(run_dir, signature)
+    print(f"[METHOD] {config.method} | enabled_losses={loss_terms_enabled}")
+    print(f"[AMP] enabled={bool(amp_enabled)}")
+    print(
+        "[MODEL] "
+        f"backbone={signature['model_components']['backbone']} "
+        f"bottleneck_dim={int(config.bottleneck_dim)} "
+        "domain_discriminator_present=False"
+    )
 
     weights: Optional[torch.Tensor] = None
     history: List[IISIterationStats] = []
@@ -359,6 +488,7 @@ def run(
         backbone_lr = config.classifier_lr * config.backbone_lr_scale
         groups = [
             {"params": [p for p in current_model.backbone.parameters() if p.requires_grad], "lr": backbone_lr},
+            {"params": list(current_model.bottleneck.parameters()), "lr": config.classifier_lr},
             {"params": list(current_model.classifier.parameters()), "lr": config.classifier_lr},
         ]
         groups = [g for g in groups if len(g["params"]) > 0]
@@ -372,10 +502,12 @@ def run(
     if resume_path is not None:
         resume_ckpt = load_checkpoint(resume_path, map_location=device)
         backbone_state = resume_ckpt.get("backbone")
+        bottleneck_state = resume_ckpt.get("bottleneck")
         classifier_state = resume_ckpt.get("classifier")
-        if backbone_state is None or classifier_state is None:
-            raise RuntimeError("Adaptation checkpoint missing backbone/classifier state.")
+        if backbone_state is None or bottleneck_state is None or classifier_state is None:
+            raise RuntimeError("Adaptation checkpoint missing backbone/bottleneck/classifier state.")
         model.backbone.load_state_dict(backbone_state, strict=False)
+        model.bottleneck.load_state_dict(bottleneck_state, strict=False)
         model.classifier.load_state_dict(classifier_state, strict=False)
         if "optimizer" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
@@ -385,6 +517,11 @@ def run(
                 scheduler_loaded = True
             except Exception:
                 scheduler_loaded = False
+        if amp_enabled and "scaler" in resume_ckpt:
+            try:
+                scaler.load_state_dict(resume_ckpt["scaler"])
+            except Exception:
+                pass
         adapt_batches_seen = int(resume_ckpt.get("adapt_batches_seen", adapt_batches_seen))
         last_completed_epoch = int(resume_ckpt.get("epoch", last_completed_epoch))
         start_epoch = max(last_completed_epoch + 1, 0)
@@ -455,6 +592,7 @@ def run(
             gmm_selection_mode=gmm_selection_mode,
             gmm_bic_min_components=gmm_bic_min,
             gmm_bic_max_components=gmm_bic_max,
+            gmm_reg_covar=gmm_reg_covar,
             cluster_backend=cluster_backend,
             vmf_kappa=vmf_kappa,
             cluster_clean_ratio=cluster_clean_ratio,
@@ -471,8 +609,66 @@ def run(
         )
         weights = weights.detach().cpu()
 
+        if weight_clip_max is not None:
+            if weight_clip_max <= 0:
+                raise ValueError("weight_clip_max must be > 0 when provided.")
+            weights = torch.clamp(weights, max=float(weight_clip_max))
+            weights = weights / (weights.sum() + 1e-12)
+
+        if weight_mix_alpha > 0:
+            alpha = float(max(0.0, min(1.0, float(weight_mix_alpha))))
+            uniform = torch.full_like(weights, 1.0 / float(max(1, int(weights.numel()))))
+            weights = (1.0 - alpha) * weights + alpha * uniform
+            weights = weights / (weights.sum() + 1e-12)
+
         iis_npz = artifacts.run_dir / "checkpoints" / f"me_iis_history_{config.run_id}.npz"
         _save_iis_npz(iis_npz, weights, history)
+
+        diagnostics_dir = artifacts.run_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        iis_history_path = diagnostics_dir / "iis_history.json"
+        weights_summary_path = diagnostics_dir / "weights_summary.json"
+
+        weights_safe = weights.detach().cpu().clamp(min=1e-12)
+        q = torch.tensor([0.01, 0.50, 0.99], dtype=weights_safe.dtype, device=weights_safe.device)
+        q01, q50, q99 = torch.quantile(weights_safe, q).tolist()
+        weights_entropy = float((-(weights_safe * weights_safe.log()).sum()).item())
+        weights_summary = {
+            "num_samples": int(weights_safe.numel()),
+            "min": float(weights_safe.min().item()),
+            "p1": float(q01),
+            "p50": float(q50),
+            "p99": float(q99),
+            "max": float(weights_safe.max().item()),
+            "entropy": float(weights_entropy),
+            "weight_clip_max": weight_clip_max,
+            "weight_mix_alpha": float(weight_mix_alpha),
+        }
+        weights_summary_path.write_text(json.dumps(weights_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        decoded_unachievable = []
+        for flat_idx in getattr(adapter, "unachievable_constraints", []) or []:
+            try:
+                layer, comp_idx, class_idx = adapter.decode_constraint(int(flat_idx))
+                decoded_unachievable.append(
+                    {"flat_idx": int(flat_idx), "layer": str(layer), "component": int(comp_idx), "class": int(class_idx)}
+                )
+            except Exception:
+                decoded_unachievable.append({"flat_idx": int(flat_idx)})
+
+        iis_history = {
+            "layers": list(feature_layers),
+            "selected_components_per_layer": adapter.get_components_per_layer(),
+            "cluster_backend": str(cluster_backend),
+            "gmm_selection_mode": str(gmm_selection_mode),
+            "gmm_reg_covar": float(gmm_reg_covar),
+            "iis_iters_requested": int(iis_iters),
+            "iis_tol": float(iis_tol),
+            "num_unachievable_constraints": int(len(decoded_unachievable)),
+            "unachievable_constraints": decoded_unachievable,
+            "history": [h.__dict__ for h in history],
+        }
+        iis_history_path.write_text(json.dumps(iis_history, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if weights is None:
         raise RuntimeError("Failed to obtain IIS weights.")
@@ -489,6 +685,8 @@ def run(
         drop_last=False,
         **loader_kwargs,
     )
+
+    one_batch_debug = bool(config.method_params.get("one_batch_debug", False))
 
     pseudo_loader: Optional[DataLoader] = None
     if use_pseudo_labels:
@@ -523,6 +721,88 @@ def run(
                 **loader_kwargs,
             )
 
+    if one_batch_debug:
+        # IIS residual summary (method-specific diagnostics).
+        if history:
+            h = history[-1]
+            print(
+                "[ONE_BATCH_DEBUG] me_iis "
+                f"iis_iters={len(history)} max_moment_error={float(h.max_moment_error):.6f} "
+                f"mean_moment_error={float(h.mean_moment_error):.6f} "
+                f"num_unachievable={int(h.num_unachievable_constraints)} "
+                f"w_min={float(h.weight_min):.6f} w_p99={float(h.weight_p99):.6f} w_max={float(h.weight_max):.6f} "
+                f"w_entropy={float(h.weight_entropy):.6f}"
+            )
+        else:
+            print("[ONE_BATCH_DEBUG] me_iis iis_iters=0 (no IIS history recorded)")
+
+        model.train()
+        images, labels, idxs = next(iter(weighted_loader))
+        images = images.to(device)
+        labels = labels.to(device)
+        batch_weights = weights[idxs].to(device)
+
+        pseudo_loss = torch.tensor(0.0, device=device)
+        pseudo_keep = 0
+        pseudo_total = 0
+        if pseudo_loader is not None:
+            try:
+                images_tgt, labels_tgt = next(iter(pseudo_loader))
+                images_tgt = images_tgt.to(device)
+                labels_tgt = labels_tgt.to(device)
+                with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+                    logits_tgt, _ = model(images_tgt, return_features=False)
+                    pseudo_loss = safe_cross_entropy(logits_tgt, labels_tgt, num_classes=int(logits_tgt.shape[1]))
+                pseudo_total = int(labels_tgt.numel())
+                pseudo_keep = pseudo_total
+            except StopIteration:
+                pseudo_loss = torch.tensor(0.0, device=device)
+
+        optimizer.zero_grad(set_to_none=True)
+        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+            logits, _ = model(images, return_features=False)
+            ce = safe_cross_entropy(logits, labels, num_classes=int(logits.shape[1]), reduction="none")
+            loss_src = (batch_weights * ce).sum() / (batch_weights.sum() + 1e-8)
+            loss = loss_src + float(pseudo_loss_weight) * pseudo_loss
+        if not torch.isfinite(loss).all().item():
+            raise RuntimeError("Non-finite loss encountered in one-batch debug.")
+        if amp_enabled:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        gn_backbone = _grad_norm(model.backbone)
+        gn_bottleneck = _grad_norm(model.bottleneck)
+        gn_head = _grad_norm(model.classifier)
+        if amp_enabled:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        src_acc = float((torch.argmax(logits, dim=1) == labels).float().mean().item() * 100.0)
+
+        print(
+            "[ONE_BATCH_DEBUG] me_iis "
+            f"weighted_cls_loss={float(loss_src.item()):.6f} pseudo_loss={float(pseudo_loss.item()):.6f} "
+            f"pseudo_keep={pseudo_keep}/{pseudo_total} src_acc={src_acc:.3f} "
+            f"grad_norm_backbone={gn_backbone:.6f} grad_norm_bottleneck={gn_bottleneck:.6f} grad_norm_head={gn_head:.6f}"
+        )
+        return {
+            "status": "one_batch_debug",
+            "run_dir": str(run_dir),
+            "weighted_cls_loss": float(loss_src.item()),
+            "pseudo_loss": float(pseudo_loss.item()),
+            "pseudo_keep": int(pseudo_keep),
+            "pseudo_total": int(pseudo_total),
+            "source_acc_batch": float(src_acc),
+            "grad_norm_backbone": float(gn_backbone),
+            "grad_norm_bottleneck": float(gn_bottleneck),
+            "grad_norm_head": float(gn_head),
+            "iis_iters": int(len(history)),
+            "iis_max_moment_error": float(history[-1].max_moment_error) if history else None,
+            "iis_num_unachievable": int(history[-1].num_unachievable_constraints) if history else None,
+        }
+
     total_epochs = int(config.epochs_adapt)
     for epoch in range(start_epoch, total_epochs):
         remaining_batches = 0
@@ -531,13 +811,19 @@ def run(
             if remaining_batches == 0:
                 break
 
+        max_batches_epoch = int(epoch_step_cap)
+        if remaining_batches > 0:
+            max_batches_epoch = int(min(max_batches_epoch, remaining_batches))
+
         loss, src_acc, batches_used, pseudo_used, pseudo_total = adapt_epoch(
             model=model,
             optimizer=optimizer,
             source_loader=weighted_loader,
             source_weights_vec=weights,
             device=device,
-            max_batches=remaining_batches,
+            amp_enabled=bool(amp_enabled),
+            scaler=scaler,
+            max_batches=max_batches_epoch,
             pseudo_loader=pseudo_loader,
             pseudo_loss_weight=pseudo_loss_weight,
         )
@@ -548,11 +834,13 @@ def run(
 
         ckpt_payload: Dict[str, Any] = {
             "backbone": model.backbone.state_dict(),
+            "bottleneck": model.bottleneck.state_dict(),
             "classifier": model.classifier.state_dict(),
             "weights": weights,
             "history": [h.__dict__ for h in history],
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            **({"scaler": scaler.state_dict()} if amp_enabled else {}),
             "epoch": last_completed_epoch,
             "num_epochs": total_epochs,
             "adapt_batches_seen": adapt_batches_seen,
@@ -594,11 +882,13 @@ def run(
 
     ckpt_final: Dict[str, Any] = {
         "backbone": model.backbone.state_dict(),
+        "bottleneck": model.bottleneck.state_dict(),
         "classifier": model.classifier.state_dict(),
         "weights": weights,
         "history": [h.__dict__ for h in history],
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        **({"scaler": scaler.state_dict()} if amp_enabled else {}),
         "epoch": last_completed_epoch,
         "num_epochs": total_epochs,
         "adapt_batches_seen": adapt_batches_seen,

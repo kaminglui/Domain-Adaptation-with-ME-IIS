@@ -17,6 +17,7 @@ def create_backend(
     gmm_selection_mode: str = "fixed",
     gmm_bic_min_components: int = 2,
     gmm_bic_max_components: int = 8,
+    gmm_reg_covar: float = 1e-6,
     kmeans_n_init: int = 10,
     vmf_kappa: float = 20.0,
 ) -> LatentBackend:
@@ -40,6 +41,7 @@ def create_backend(
             selection_mode=gmm_selection_mode,
             bic_min_components=gmm_bic_min_components,
             bic_max_components=gmm_bic_max_components,
+            reg_covar=float(gmm_reg_covar),
         )
         return GMMBackend(n_components=n_components, random_state=seed, config=cfg, layer_name=layer_name)
     if name == "vmf_softmax":

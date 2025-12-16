@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -13,6 +14,7 @@ from torch.utils.data import DataLoader
 from datasets.domain_loaders import get_domain_loaders
 from eval import evaluate
 from models.classifier import build_model
+from src.experiments.budget import compute_step_budget
 from src.experiments.checkpointing import (
     RunState,
     ensure_run_dirs,
@@ -25,6 +27,8 @@ from src.experiments.checkpointing import (
 )
 from src.experiments.run_artifacts import RunArtifacts
 from src.experiments.run_config import RunConfig, get_run_dir, save_config
+from src.experiments.loss_checks import safe_cross_entropy
+from src.experiments.signature import hash_model_state, write_signature
 from utils.data_utils import build_loader, make_generator, make_worker_init_fn
 from utils.resource_utils import (
     auto_tune_dataloader,
@@ -51,11 +55,24 @@ def _compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return float((preds == labels).float().mean().item() * 100.0)
 
 
+def _grad_norm(module: nn.Module) -> float:
+    total_sq = 0.0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        total_sq += float(g.norm(2).item()) ** 2
+    return float(total_sq**0.5)
+
+
 def _train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: optim.Optimizer,
     device: torch.device,
+    *,
+    amp_enabled: bool,
+    scaler: Optional[torch.cuda.amp.GradScaler],
     max_batches: int = 0,
 ) -> Tuple[float, float, int]:
     model.train()
@@ -67,11 +84,19 @@ def _train_one_epoch(
         images = images.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad()
-        logits, _ = model(images, return_features=False)
-        loss = F.cross_entropy(logits, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+            logits, _ = model(images, return_features=False)
+            loss = safe_cross_entropy(logits, labels, num_classes=int(logits.shape[1]))
+        if amp_enabled:
+            if scaler is None:
+                raise RuntimeError("AMP enabled but GradScaler is None.")
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         bs = labels.size(0)
         running_loss += float(loss.item()) * bs
@@ -88,7 +113,7 @@ def run(
     config: RunConfig,
     force_rerun: bool = False,
     runs_root: Optional[Path] = None,
-    save_every_epochs: int = 1,
+    save_every_epochs: int = 0,
 ) -> Dict[str, Any]:
     run_dir = get_run_dir(config, runs_root=runs_root)
     artifacts = RunArtifacts(run_dir=run_dir, run_id=config.run_id, stage="source", method=config.method)
@@ -113,7 +138,7 @@ def run(
     data_generator = make_generator(config.seed)
     worker_init = make_worker_init_fn(config.seed)
 
-    source_loader, _, target_eval_loader = get_domain_loaders(
+    source_loader, target_train_loader, target_eval_loader = get_domain_loaders(
         dataset_name=config.dataset_name,
         source_domain=config.source_domain,
         target_domain=config.target_domain,
@@ -127,10 +152,21 @@ def run(
     )
 
     source_ds = source_loader.dataset
+    target_train_ds = target_train_loader.dataset
     target_eval_ds = target_eval_loader.dataset
 
     num_classes = _infer_num_classes(source_loader)
-    model = build_model(num_classes=num_classes, pretrained=config.backbone_pretrained).to(device)
+    model = build_model(
+        num_classes=num_classes,
+        pretrained=config.backbone_pretrained,
+        bottleneck_dim=int(config.bottleneck_dim),
+        bottleneck_bn=bool(config.bottleneck_bn),
+        bottleneck_relu=bool(config.bottleneck_relu),
+        bottleneck_dropout=float(config.bottleneck_dropout),
+    ).to(device)
+
+    amp_enabled = bool(config.method_params.get("amp", True)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     if auto_resources_enabled(default=False):
         resources = detect_resources(disk_path=run_dir, data_path=data_root, cuda_device=int(device.index or 0))
@@ -173,11 +209,13 @@ def run(
         )
 
     loader_kwargs = dl_tuning.as_loader_kwargs()
+    resolved_batch_size = int(dl_tuning.batch_size)
+    resolved_num_workers = int(dl_tuning.num_workers)
     source_loader = build_loader(
         source_ds,
-        batch_size=dl_tuning.batch_size,
+        batch_size=resolved_batch_size,
         shuffle=True,
-        num_workers=dl_tuning.num_workers,
+        num_workers=resolved_num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
@@ -185,18 +223,93 @@ def run(
     )
     target_eval_loader = build_loader(
         target_eval_ds,
-        batch_size=dl_tuning.batch_size,
+        batch_size=resolved_batch_size,
         shuffle=False,
-        num_workers=dl_tuning.num_workers,
+        num_workers=resolved_num_workers,
+        seed=config.seed,
+        generator=data_generator,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    target_train_loader = build_loader(
+        target_train_ds,
+        batch_size=resolved_batch_size,
+        shuffle=True,
+        num_workers=resolved_num_workers,
         seed=config.seed,
         generator=data_generator,
         drop_last=False,
         **loader_kwargs,
     )
 
+    budget = compute_step_budget(
+        method=str(config.method),
+        epochs_source=int(config.epochs_source),
+        epochs_adapt=int(config.epochs_adapt),
+        source_batches_per_epoch=int(len(source_loader)),
+        target_batches_per_epoch=int(len(target_train_loader)),
+    )
+    print(
+        "[BUDGET] "
+        f"source_batches/epoch={int(budget.source_batches_per_epoch)} "
+        f"target_batches/epoch={int(budget.target_batches_per_epoch)} "
+        f"adapt_steps/epoch={int(budget.adapt_steps_per_epoch)} "
+        f"steps_total={int(budget.steps_total)}"
+    )
+
+    loss_terms_enabled = {
+        "cls": True,
+        "domain_adv": False,
+        "mmd": False,
+        "jmmd": False,
+        "cdan": False,
+        "iis": False,
+        "pseudo": False,
+    }
+    signature = {
+        "method_name": config.method,
+        "source_checkpoint": None,
+        "method_params_used": {
+            "amp": bool(amp_enabled),
+            **({"one_batch_debug": True} if bool(config.method_params.get("one_batch_debug", False)) else {}),
+        },
+        "loss_terms_enabled": loss_terms_enabled,
+        "model_components": {
+            "backbone": type(model.backbone).__name__,
+            "bottleneck": type(model.bottleneck).__name__,
+            "bottleneck_dim": int(config.bottleneck_dim),
+            "classifier": type(model.classifier).__name__,
+            "domain_discriminator_present": False,
+        },
+        "dataloader": {
+            "batch_size": int(resolved_batch_size),
+            "num_workers": int(resolved_num_workers),
+            **{k: v for k, v in loader_kwargs.items() if v is not None},
+        },
+        "step_budget": {
+            "source_batches_per_epoch": int(budget.source_batches_per_epoch),
+            "target_batches_per_epoch": int(budget.target_batches_per_epoch),
+            "adapt_steps_per_epoch": int(budget.adapt_steps_per_epoch),
+            "steps_source": int(budget.steps_source),
+            "steps_adapt": int(budget.steps_adapt),
+            "steps_total": int(budget.steps_total),
+        },
+        "model_state_hash": hash_model_state(model),
+    }
+    write_signature(run_dir, signature)
+    print(f"[METHOD] {config.method} | enabled_losses={loss_terms_enabled}")
+    print(f"[AMP] enabled={bool(amp_enabled)}")
+    print(
+        "[MODEL] "
+        f"backbone={signature['model_components']['backbone']} "
+        f"bottleneck_dim={int(config.bottleneck_dim)} "
+        "domain_discriminator_present=False"
+    )
+
     def _make_optimizer_and_scheduler(current_model: nn.Module):
         params = [
             {"params": current_model.backbone.parameters(), "lr": config.lr_backbone},
+            {"params": current_model.bottleneck.parameters(), "lr": config.lr_classifier},
             {"params": current_model.classifier.parameters(), "lr": config.lr_classifier},
         ]
         opt = optim.SGD(params, momentum=config.momentum, weight_decay=config.weight_decay)
@@ -204,6 +317,45 @@ def run(
         return opt, sched
 
     optimizer, scheduler = _make_optimizer_and_scheduler(model)
+    one_batch_debug = bool(config.method_params.get("one_batch_debug", False))
+    if one_batch_debug:
+        model.train()
+        images, labels = next(iter(source_loader))
+        images = images.to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        with (torch.autocast("cuda", dtype=torch.float16) if amp_enabled else nullcontext()):
+            logits, _ = model(images, return_features=False)
+            loss = safe_cross_entropy(logits, labels, num_classes=int(logits.shape[1]))
+        if not torch.isfinite(loss).all().item():
+            raise RuntimeError("Non-finite loss encountered in one-batch debug.")
+        if amp_enabled:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        gn_backbone = _grad_norm(model.backbone)
+        gn_bottleneck = _grad_norm(model.bottleneck)
+        gn_head = _grad_norm(model.classifier)
+        if amp_enabled:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        acc = _compute_accuracy(logits.detach(), labels)
+        print(
+            "[ONE_BATCH_DEBUG] source_only "
+            f"cls_loss={float(loss.item()):.6f} src_acc={acc:.3f} "
+            f"grad_norm_backbone={gn_backbone:.6f} grad_norm_bottleneck={gn_bottleneck:.6f} grad_norm_head={gn_head:.6f}"
+        )
+        return {
+            "status": "one_batch_debug",
+            "run_dir": str(run_dir),
+            "cls_loss": float(loss.item()),
+            "source_acc_batch": float(acc),
+            "grad_norm_backbone": float(gn_backbone),
+            "grad_norm_bottleneck": float(gn_bottleneck),
+            "grad_norm_head": float(gn_head),
+        }
     start_epoch = 0
     last_completed_epoch = -1
     scheduler_loaded = False
@@ -214,10 +366,12 @@ def run(
     if resume_path is not None:
         ckpt = load_checkpoint(resume_path, map_location=device)
         backbone_state = ckpt.get("backbone")
+        bottleneck_state = ckpt.get("bottleneck")
         classifier_state = ckpt.get("classifier")
-        if backbone_state is None or classifier_state is None:
-            raise RuntimeError("Resume checkpoint missing backbone/classifier state.")
+        if backbone_state is None or bottleneck_state is None or classifier_state is None:
+            raise RuntimeError("Resume checkpoint missing backbone/bottleneck/classifier state.")
         model.backbone.load_state_dict(backbone_state, strict=False)
+        model.bottleneck.load_state_dict(bottleneck_state, strict=False)
         model.classifier.load_state_dict(classifier_state, strict=False)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -227,6 +381,11 @@ def run(
                 scheduler_loaded = True
             except Exception:
                 scheduler_loaded = False
+        if amp_enabled and "scaler" in ckpt:
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+            except Exception:
+                pass
         best_target_acc = float(ckpt.get("best_target_acc", best_target_acc))
         final_source_acc = float(ckpt.get("source_acc", final_source_acc))
         last_completed_epoch = int(ckpt.get("epoch", last_completed_epoch))
@@ -250,6 +409,8 @@ def run(
             loader=source_loader,
             optimizer=optimizer,
             device=device,
+            amp_enabled=bool(amp_enabled),
+            scaler=scaler,
             max_batches=remaining_batches,
         )
         batches_seen_total += batches_used
@@ -261,9 +422,11 @@ def run(
 
         ckpt_payload: Dict[str, Any] = {
             "backbone": model.backbone.state_dict(),
+            "bottleneck": model.bottleneck.state_dict(),
             "classifier": model.classifier.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            **({"scaler": scaler.state_dict()} if amp_enabled else {}),
             "epoch": last_completed_epoch,
             "num_epochs": total_epochs,
             "best_target_acc": best_target_acc,
@@ -296,9 +459,11 @@ def run(
 
     ckpt_final: Dict[str, Any] = {
         "backbone": model.backbone.state_dict(),
+        "bottleneck": model.bottleneck.state_dict(),
         "classifier": model.classifier.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        **({"scaler": scaler.state_dict()} if amp_enabled else {}),
         "epoch": last_completed_epoch,
         "num_epochs": total_epochs,
         "best_target_acc": best_target_acc,

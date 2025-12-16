@@ -1,6 +1,5 @@
 import unittest
 
-from scripts.run_me_iis_experiments import parse_seeds
 from utils.experiment_utils import (
     build_components_map,
     dataset_tag,
@@ -66,18 +65,6 @@ class TestBuildComponentsMap(unittest.TestCase):
     def test_unknown_layer_raises(self) -> None:
         with self.assertRaises(ValueError):
             build_components_map(self.feature_layers, 5, "layerX:10")
-
-
-class TestParseSeeds(unittest.TestCase):
-    def test_parse_seeds_basic(self) -> None:
-        self.assertEqual(parse_seeds("0,1,2"), [0, 1, 2])
-
-    def test_parse_seeds_whitespace(self) -> None:
-        self.assertEqual(parse_seeds(" 0 , 2 , 4 "), [0, 2, 4])
-
-    def test_parse_seeds_empty_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            parse_seeds("")
 
 
 if __name__ == "__main__":

@@ -86,13 +86,16 @@ class TinyBackbone(nn.Module):
 class TinyModel(nn.Module):
     """Tiny classifier that mimics the ME-IIS model interface."""
 
-    def __init__(self, num_classes: int, feature_dim: int = 32):
+    def __init__(self, num_classes: int, feature_dim: int = 32, bottleneck_dim: int = 32):
         super().__init__()
         self.backbone = TinyBackbone(feature_dim=feature_dim)
-        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.bottleneck = nn.Linear(feature_dim, bottleneck_dim)
+        self.classifier = nn.Linear(bottleneck_dim, num_classes)
+        self.feature_dim = int(bottleneck_dim)
 
     def forward(self, x: torch.Tensor, return_features: bool = False):
         feats = self.backbone(x)
+        feats = torch.relu(self.bottleneck(feats))
         logits = self.classifier(feats)
         if return_features:
             return logits, feats
@@ -100,10 +103,23 @@ class TinyModel(nn.Module):
 
     def forward_with_intermediates(self, x: torch.Tensor, feature_layers):
         feats, intermediates = self.backbone.forward_intermediates(x, feature_layers)
+        feats = torch.relu(self.bottleneck(feats))
         logits = self.classifier(feats)
         return logits, feats, intermediates
 
 
-def build_tiny_model(num_classes: int, feature_dim: int = 32, pretrained: bool = True) -> nn.Module:
+def build_tiny_model(
+    num_classes: int,
+    feature_dim: int = 32,
+    pretrained: bool = True,
+    *,
+    bottleneck_dim: int = 32,
+    bottleneck_bn: bool = True,
+    bottleneck_relu: bool = True,
+    bottleneck_dropout: float = 0.0,
+    **_: object,
+) -> nn.Module:
     """Factory to mirror models.classifier.build_model for tests."""
-    return TinyModel(num_classes=num_classes, feature_dim=feature_dim)
+    # Keep the tiny model simple: ignore BN/dropout toggles.
+    _ = (pretrained, bottleneck_bn, bottleneck_relu, bottleneck_dropout)
+    return TinyModel(num_classes=num_classes, feature_dim=feature_dim, bottleneck_dim=int(bottleneck_dim))

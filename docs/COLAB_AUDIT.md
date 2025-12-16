@@ -20,7 +20,7 @@ This notebook is a Python-orchestrated (in-process) runner. It does **not** prim
   - Mode: `MODE = "QUICK" | "FULL"`
   - Seeds: `SEEDS = [0] if MODE == "QUICK" else [0, 1, 2]`
   - Shared training budget: `EPOCHS_SOURCE`, `EPOCHS_ADAPT`, `BATCH_SIZE`, `NUM_WORKERS`
-  - Method knobs in dicts: `ME_IIS_PARAMS`, `DANN_PARAMS`, `CORAL_PARAMS`, `PL_PARAMS`
+  - Method knobs in dicts: `ME_IIS_PARAMS`, `DANN_PARAMS`, `PL_PARAMS`
   - Output root: `RUNS_ROOT = Path("outputs") / "runs"`
 
 ### Data cell (download/verify)
@@ -42,7 +42,7 @@ This notebook is a Python-orchestrated (in-process) runner. It does **not** prim
   - Runs `method="me_iis"` for each seed via `run_one_nb(...)`
 - Code cell 13:
   - Runs baselines for each seed via `run_one_nb(...)`:
-    - `method="dann"`, `method="coral"`, `method="pseudo_label"`
+    - `method="dann"`, `method="dan"`, `method="jan"`, `method="cdan"`, `method="pseudo_label"`
 
 ### Output layout expected by the notebook
 The notebook constructs `RunConfig.run_id` and expects each run to live under:
@@ -73,14 +73,13 @@ The notebook output contains a displayed table built from existing `metrics.csv`
 
 ```
         method  seed  source_acc  target_acc      run_id
-0        coral     0   80.428513   33.127148  ffc0b32a86
-1         dann     0   80.428513   33.127148  ab83d40821
-2       me_iis     0   76.967450   28.568156  d3b3fbdc39
-3  source_only     0   78.038731   30.148912  f2fc29f097
+0         dann     0   80.428513   33.127148  ab83d40821
+1       me_iis     0   76.967450   28.568156  d3b3fbdc39
+2  source_only     0   78.038731   30.148912  f2fc29f097
 ```
 
 The notebook output also prints:
-- `[Summary] Found 4 metrics.csv files under outputs/runs/office-home/Ar2Cl`
+- `[Summary] Found metrics.csv files under outputs/runs/office-home/Ar2Cl`
 - `[Export] Wrote: outputs/runs/office-home/Ar2Cl/all_metrics.csv`
 
 ## B2) Output integrity diagnosis and fix (run_id-based aggregation)
@@ -105,4 +104,3 @@ And the notebook summary/export cells were updated to:
 ### Legacy (non-unified) CSV logging robustness
 Separately, legacy scripts write `results/office_home_me_iis.csv`. This repo now:
 - adds a `run_id` column and uses `utils/logging_utils.py:upsert_csv_row(...)` keyed by `run_id` so repeated resumes do not append duplicate rows.
-

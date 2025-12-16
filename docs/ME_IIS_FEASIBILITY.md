@@ -27,7 +27,7 @@ Evidence:
 Evidence from the stored notebook metrics table (Office-Home `Ar→Cl`, seed=0):
 - `source_only` target_acc: `30.148912`
 - `me_iis` target_acc: `28.568156`
-- `dann` / `coral` target_acc: `33.127148`
+- `dann` target_acc: `33.127148`
 
 In that table, ME-IIS is below source-only and below the baselines for that single reported seed.
 
@@ -64,4 +64,3 @@ For a quick feasibility check without multi-seed cost, run the minimal sweep des
 - reduce unachievable constraints,
 - avoid weight collapse, and
 - beat source-only on at least one representative task under a fixed training budget.
-

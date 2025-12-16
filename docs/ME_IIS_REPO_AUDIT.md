@@ -59,7 +59,7 @@ Top-level entries and their roles:
   - Reads `results/office_home_me_iis.csv` and resolves the expected row by `run_id`
   - Writes a summary CSV to `results/me_iis_experiments_summary.csv` by default
 - Unified runner: `src/experiments/runner.py:run_one(config, ...)`
-  - Runs methods in-process: `src/experiments/methods/source_only.py:run(...)`, `src/experiments/methods/me_iis.py:run(...)`, `src/experiments/methods/dann.py:run(...)`, `src/experiments/methods/coral.py:run(...)`, `src/experiments/methods/pseudo_label.py:run(...)`
+  - Runs methods in-process: `src/experiments/methods/source_only.py:run(...)`, `src/experiments/methods/me_iis.py:run(...)`, `src/experiments/methods/dann.py:run(...)`, `src/experiments/methods/pseudo_label.py:run(...)`
   - Writes a deterministic run directory per config:
     - `src/experiments/run_config.py:get_run_dir(...)` → `outputs/runs/{dataset_tag}/{src}2{tgt}/{method}/{run_id}/`
     - `config.json` via `src/experiments/run_config.py:save_config(...)`
@@ -211,7 +211,7 @@ Coverage highlights (by test module intent):
   - Legacy CSV idempotent upsert keyed by `run_id`: `tests/test_results_logging.py`
   - Notebook summary row status logic: `tests/test_results_logging.py`
 - Baselines sanity:
-  - DANN/CORAL related tests: `tests/test_dann_sanity.py`, `tests/test_coral_loss.py`
+  - DANN related tests: `tests/test_dann_sanity.py`
 - CLI argument parsing / invalid flags:
   - `tests/test_cli_flags_*.py`, `tests/test_cli_invalid_args.py`
 
