@@ -566,6 +566,7 @@ def run(
         avg_dom_acc = epoch_dom_acc / denom
         avg_ent = epoch_entropy / denom
         avg_src_acc = epoch_src_acc / denom
+        src_acc = float(avg_src_acc)
         print(
             f"[CDAN] epoch={epoch + 1}/{total_epochs} "
             f"loss={avg_loss:.6f} cdan_loss={avg_dom:.6f} dom_acc={avg_dom_acc:.3f} "

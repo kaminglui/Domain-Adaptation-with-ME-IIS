@@ -595,6 +595,7 @@ def run(
         avg_dom_loss = epoch_dom_loss / max(1, epoch_batches)
         avg_dom_acc = epoch_dom_acc / max(1, epoch_batches)
         avg_src_acc = epoch_src_acc / max(1, epoch_batches)
+        src_acc = float(avg_src_acc)
         print(
             f"[DANN] epoch={epoch + 1}/{total_epochs} "
             f"loss={avg_loss:.6f} dom_loss={avg_dom_loss:.6f} dom_acc={avg_dom_acc:.3f} "

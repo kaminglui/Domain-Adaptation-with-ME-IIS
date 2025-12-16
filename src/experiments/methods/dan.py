@@ -455,6 +455,7 @@ def run(
         avg_cls = epoch_cls / denom
         avg_mmd = epoch_mmd / denom
         avg_src_acc = epoch_src_acc / denom
+        src_acc = float(avg_src_acc)
         print(
             f"[DAN] epoch={epoch + 1}/{total_epochs} "
             f"loss={avg_loss:.6f} mmd={avg_mmd:.6f} mmd_weight={float(mmd_weight):.3f}"
