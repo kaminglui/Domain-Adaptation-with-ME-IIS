@@ -1,5 +1,6 @@
 torch
 torchvision
+wilds
 numpy
 scikit-learn
 tqdm

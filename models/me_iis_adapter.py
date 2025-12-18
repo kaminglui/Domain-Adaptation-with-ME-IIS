@@ -25,6 +25,7 @@ class IISIterationStats:
     feature_mass_max: float
     feature_mass_mean: float
     feature_mass_std: float
+    objective: float = float("nan")
 
 
 class MaxEntAdapter:
@@ -51,6 +52,7 @@ class MaxEntAdapter:
         gmm_selection_mode: str = "fixed",
         gmm_bic_min_components: int = 2,
         gmm_bic_max_components: int = 8,
+        gmm_covariance_type: str = "diag",
         gmm_reg_covar: float = 1e-6,
         cluster_backend: str = "gmm",
         vmf_kappa: float = 20.0,
@@ -65,6 +67,7 @@ class MaxEntAdapter:
         self.gmm_selection_mode = gmm_selection_mode
         self.gmm_bic_min_components = gmm_bic_min_components
         self.gmm_bic_max_components = gmm_bic_max_components
+        self.gmm_covariance_type = str(gmm_covariance_type)
         self.gmm_reg_covar = float(gmm_reg_covar)
         self.cluster_backend = cluster_backend
         self.vmf_kappa = vmf_kappa
@@ -93,6 +96,7 @@ class MaxEntAdapter:
             gmm_selection_mode=self.gmm_selection_mode,
             gmm_bic_min_components=self.gmm_bic_min_components,
             gmm_bic_max_components=self.gmm_bic_max_components,
+            gmm_covariance_type=self.gmm_covariance_type,
             gmm_reg_covar=self.gmm_reg_covar,
             kmeans_n_init=self.kmeans_n_init,
             vmf_kappa=self.vmf_kappa,
@@ -229,9 +233,12 @@ class MaxEntAdapter:
         target_class_probs: Optional[torch.Tensor],
         max_iter: int = 15,
         iis_tol: float = 0.0,
+        iis_step_size: float = 1.0,
+        iis_damping: float = 0.0,
         f_mass_rel_tol: float = 1e-2,
         precomputed_source_joint: Optional[Dict[str, torch.Tensor]] = None,
         precomputed_target_joint: Optional[Dict[str, torch.Tensor]] = None,
+        target_moments_override: Optional[torch.Tensor] = None,
         verbose: bool = False,
     ) -> Tuple[torch.Tensor, List[IISIterationStats]]:
         """
@@ -244,11 +251,18 @@ class MaxEntAdapter:
             target_class_probs: (N_t, K) P(Ĉ|x_t) from source model.
             max_iter: number of IIS iterations.
             iis_tol: convergence tolerance on max_abs_error for early stopping.
+            iis_step_size: multiplicative step size on IIS delta updates.
+            iis_damping: EMA-style damping in [0,1) on delta updates (0 disables).
             f_mass_rel_tol: relative std threshold to warn on feature-mass non-constancy.
             precomputed_source_joint: optional joint feature tensor dict for synthetic tests.
             precomputed_target_joint: optional joint feature tensor dict for synthetic tests.
+            target_moments_override: optional precomputed target moments vector (C,) for EMA constraints.
             verbose: if True, log per-iteration weight statistics for debugging.
         """
+        if iis_step_size <= 0:
+            raise ValueError(f"iis_step_size must be > 0, got {iis_step_size}.")
+        if not (0.0 <= iis_damping < 1.0):
+            raise ValueError(f"iis_damping must be in [0,1), got {iis_damping}.")
         device = self.device
         iis = self.iis_updater
         # Compute target constraint moments (Eq. 14)
@@ -262,6 +276,21 @@ class MaxEntAdapter:
             target_joint = self.get_joint_features(target_layer_feats, target_class_probs)
         target_flat, _ = self._validate_joint_features(target_joint, name="target_joint", rel_mass_tol=f_mass_rel_tol)
         target_moments = iis.compute_pg(target_flat.to(device))  # (C,)
+        if target_moments_override is not None:
+            override = torch.as_tensor(target_moments_override, dtype=target_moments.dtype, device=device)
+            if override.shape != target_moments.shape:
+                raise ValueError(
+                    f"target_moments_override must have shape {tuple(target_moments.shape)}, got {tuple(override.shape)}."
+                )
+            if torch.any(override < 0):
+                raise ValueError("target_moments_override must be elementwise non-negative.")
+            target_moments = override
+            expected_mass = float(len(self.layers))
+            mass = float(target_moments.sum().detach().cpu().item())
+            if abs(mass - expected_mass) > 1e-3:
+                print(
+                    f"[IIS][WARN] target_moments_override mass={mass:.6f} deviates from expected {expected_mass:.6f}."
+                )
 
         # Build source joint features (Eq. 15 uses the same joint construction)
         if precomputed_source_joint is not None:
@@ -294,6 +323,9 @@ class MaxEntAdapter:
         N_s = source_flat.size(0)
         weights = torch.full((N_s,), 1.0 / float(N_s), dtype=source_flat.dtype, device=device)
         self._assert_valid_distribution(weights, name="IIS initial weights")
+        lambda_vec = torch.zeros_like(target_moments, device=device)
+        logZ = float(torch.log(torch.tensor(float(N_s), dtype=source_flat.dtype, device=device)).detach().cpu().item())
+        obj_prev = float((lambda_vec * target_moments).sum().detach().cpu().item()) - logZ
         f_mass_mean = float(feature_mass.mean().item())
         f_mass_std = float(feature_mass.std().item())
         eps = 1e-8
@@ -313,17 +345,38 @@ class MaxEntAdapter:
 
         history: List[IISIterationStats] = []
         converged = False
+        prev_delta: Optional[torch.Tensor] = None
         for it in range(max_iter):
-            step_result = iis.step(weights, source_flat, target_moments)
-            delta_update = step_result.delta
-            weights = step_result.updated_weights
+            pm = iis.compute_pm(weights, source_flat)
+            delta_update = iis.delta_lambda(target_moments, pm)
+            delta_applied = float(iis_step_size) * delta_update
+            if prev_delta is not None and iis_damping > 0:
+                delta_applied = (1.0 - float(iis_damping)) * delta_applied + float(iis_damping) * prev_delta
+
+            exponent = torch.sum(source_flat * delta_applied.unsqueeze(0), dim=1)
+            new_unscaled = weights * torch.exp(exponent)
+            total = new_unscaled.sum()
+            if float(total.detach().cpu().item()) <= iis.eps:
+                raise RuntimeError("Weights collapsed to ~0 mass during IIS update.")
+            weights = torch.clamp(new_unscaled, min=0.0) / total
             self._assert_valid_distribution(weights, name="IIS weights")
+            prev_delta = delta_applied.detach()
+
+            lambda_vec = lambda_vec + delta_applied
+            logZ = logZ + float(torch.log(total).detach().cpu().item())
+            objective = float((lambda_vec * target_moments).sum().detach().cpu().item()) - logZ
+            if objective + 1e-10 < obj_prev:
+                print(
+                    f"[IIS][WARN] Dual objective decreased: prev={obj_prev:.6f} -> now={objective:.6f} "
+                    f"(step_size={iis_step_size}, damping={iis_damping})."
+                )
+            obj_prev = objective
 
             updated_moments = iis.compute_pm(weights, source_flat)
             moment_error = updated_moments - target_moments
             max_abs_error = float(moment_error.abs().max().detach().cpu().item())
             l2_error = float(moment_error.pow(2).sum().sqrt().detach().cpu().item())
-            delta_norm = float(delta_update.norm().detach().cpu().item())
+            delta_norm = float(delta_applied.norm().detach().cpu().item())
             kl = self._kl_div(target_moments, updated_moments)
             w_cpu = weights.detach().cpu()
             entropy = float(-(weights * torch.log(weights + 1e-12)).detach().cpu().sum().item())
@@ -341,6 +394,7 @@ class MaxEntAdapter:
                 feature_mass_max=float(feature_mass.max().detach().cpu().item()),
                 feature_mass_mean=f_mass_mean,
                 feature_mass_std=f_mass_std,
+                objective=objective,
             )
             history.append(hist)
             if verbose:
@@ -351,7 +405,7 @@ class MaxEntAdapter:
                 )
                 sys.stdout.flush()
             print(
-                f"[IIS] iter {it+1}/{max_iter} | ||delta|| {delta_norm:.4f} | "
+                f"[IIS] iter {it+1}/{max_iter} | obj {objective:.6f} | ||delta|| {delta_norm:.4f} | "
                 f"KL {kl:.4e} | max mom err {hist.max_moment_error:.4e} | "
                 f"L2 err {hist.l2_moment_error:.4e} | H(Q) {hist.weight_entropy:.4f}"
             )
@@ -404,7 +458,10 @@ class MaxEntAdapter:
         target_joint: Dict[str, torch.Tensor],
         max_iter: int = 15,
         iis_tol: float = 0.0,
+        iis_step_size: float = 1.0,
+        iis_damping: float = 0.0,
         f_mass_rel_tol: float = 1e-2,
+        target_moments_override: Optional[torch.Tensor] = None,
         verbose: bool = False,
     ) -> Tuple[torch.Tensor, float, List[IISIterationStats]]:
         """Run IIS directly on precomputed joint constraint features."""
@@ -415,9 +472,12 @@ class MaxEntAdapter:
             target_class_probs=None,
             max_iter=max_iter,
             iis_tol=iis_tol,
+            iis_step_size=iis_step_size,
+            iis_damping=iis_damping,
             f_mass_rel_tol=f_mass_rel_tol,
             precomputed_source_joint=source_joint,
             precomputed_target_joint=target_joint,
+            target_moments_override=target_moments_override,
             verbose=verbose,
         )
         final_error = history[-1].max_moment_error if history else float("nan")

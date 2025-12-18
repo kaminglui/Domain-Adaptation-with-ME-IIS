@@ -2,7 +2,9 @@
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kaminglui/Domain-Adaptation-with-ME-IIS/blob/main/notebooks/Run_All_Experiments.ipynb)
 
 ## Overview
-This repo provides a correctness-first, reproducible UDA pipeline for Office-Home / Office-31 with:
+This repo provides a correctness-first, reproducible UDA pipeline for:
+- **Camelyon17 (WILDS)**: ERM, DANN, and ME-IIS baselines using the official `wilds` dataset/splits/metrics
+- **Office-Home / Office-31** (legacy notebook cells + CLI) with:
 - **ME-IIS** (max-entropy importance sampling) + diagnostics
 - Standard UDA baselines: **source_only, dann, dan, jan, cdan** (optional `pseudo_label`)
 - A single unified runner that enforces fair comparisons and writes a `signature.json` guard per run
@@ -34,8 +36,17 @@ Outputs are written to:
 ## Notebook
 - `notebooks/Run_All_Experiments.ipynb` runs the full suite (quick/full), handles failed runs explicitly, and reports paper-style 12-transfer averages.
 
+## Camelyon17 (WILDS) in Colab
+- Open `notebooks/Run_All_Experiments.ipynb` and run the top “Camelyon17 (WILDS)” section.
+- Set `PROJECT_FOLDER` in the `[A1] Drive + Paths` cell to control where checkpoints/results are written in Drive.
+- Dataset download root defaults to local SSD (`/content/data/wilds`) for performance; change `WILDS_DATA_ROOT` if you need Drive persistence.
+- Outputs:
+  - Checkpoints: `CKPT_ROOT/<run_id>/{best.pt,last.pt}`
+  - Metrics: `CKPT_ROOT/<run_id>/results.json`
+  - Summary table: `OUT_ROOT/summary.csv`
+
 ## Development
-- Tests: `python -m pytest -q`
+- Tests: `pip install -r requirements-dev.txt && python -m pytest -q`
 - Unused-code audit: `python tools/audit_unused.py` (writes `docs/UNUSED_CODE_REPORT.md`)
 
 ## Legacy
