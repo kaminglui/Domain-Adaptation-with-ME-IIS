@@ -17,7 +17,7 @@ class ERM(Algorithm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.extract_features(x)
-        return self.classifier(feats)
+        return self.classify_from_features(feats)
 
     def update(self, labeled_batch: Any, unlabeled_batch: Any | None = None) -> Dict[str, Any]:
         batch = unpack_wilds_batch(labeled_batch)

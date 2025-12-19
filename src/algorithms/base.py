@@ -75,11 +75,20 @@ class Algorithm(nn.Module):
             mode = "train" if self.training else "eval"
             shape = tuple(feats.shape)
             print(
-                f"[features] backbone={bb} pretrained={pt} feat_layer={layer} feature_dim={feat_dim} "
+                f"[features] backbone={bb} pretrained={pt} feature_keys=[{layer}] selected_key={layer} "
+                f"feature_dim={feat_dim} "
                 f"f(x)_shape={shape} model_mode={mode}"
             )
             self._feature_info_logged = True
         return feats
+
+    def classify_from_features(self, feats: torch.Tensor) -> torch.Tensor:
+        classifier = getattr(self, "classifier", None)
+        if classifier is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no attribute 'classifier'; cannot compute logits from f(x)."
+            )
+        return classifier(feats)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError

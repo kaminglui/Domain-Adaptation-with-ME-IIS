@@ -105,5 +105,9 @@ def fingerprint_config(config: Mapping[str, Any]) -> str:
 
     Uses a canonical JSON dump with sorted keys and sha1 hashing.
     """
-    payload = json.dumps(config, sort_keys=True, default=str, separators=(",", ":"))
+    # Intentionally ignore runtime/control keys that should not invalidate a run's artifacts.
+    # (e.g. re-running with --force_rerun should not make future "skip" checks fail.)
+    ignore_keys = {"force_rerun", "resume", "device"}
+    filtered = {k: v for k, v in config.items() if k not in ignore_keys}
+    payload = json.dumps(filtered, sort_keys=True, default=str, separators=(",", ":"))
     return sha1(payload.encode("utf-8")).hexdigest()

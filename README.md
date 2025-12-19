@@ -36,6 +36,22 @@ Outputs are written to:
 ## Notebook
 - `notebooks/Run_All_Experiments.ipynb` runs the full suite (quick/full), handles failed runs explicitly, and reports paper-style 12-transfer averages.
 
+## Camelyon17 Quickstart (WILDS)
+Recommended entrypoint: `experiment.py` (method-only runs + smoke tests).
+
+Examples:
+- ERM smoke: `python experiment.py --dataset camelyon17 --methods source_only --smoke_test --seed 0`
+- ME-IIS smoke (auto-runs source-only dependency if needed): `python experiment.py --dataset camelyon17 --methods me_iis --smoke_test --seed 0 --split_mode align_val`
+- Full ME-IIS only run (UDA target protocol): `python experiment.py --dataset camelyon17 --methods me_iis --seed 0 --split_mode uda_target --batch_size auto --num_workers auto`
+
+Notes:
+- Default WILDS root selection:
+  - Uses `--data_root` if provided, else `WILDS_DATA_ROOT` if set.
+  - In Colab (when unset), chooses `/content/data/wilds` if local disk has headroom, otherwise `/content/drive/MyDrive/data/wilds`, and prints disk usage.
+- Resume/skip: rerunning the same command reuses the existing run directory unless `--force_rerun` is set.
+- Outputs are written under `outputs/runs/camelyon17/{split_mode}/{method}/{run_id}/` with `config.json`, `fingerprint.txt`, `metrics.json`, `stdout.log`, `best.pt`, `last.pt`.
+- Label-leakage protocol note: `docs/CAMELYON17_LABEL_LEAKAGE.md`
+
 ## Camelyon17 (WILDS) in Colab
 - Open `notebooks/Run_All_Experiments.ipynb` and run the top “Camelyon17 (WILDS)” section.
 - Set `PROJECT_FOLDER` in the `[A1] Drive + Paths` cell to control where checkpoints/results are written in Drive.

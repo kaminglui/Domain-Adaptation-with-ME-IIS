@@ -32,6 +32,7 @@ class MEIISConfig:
     target_conf_thresh: float = 0.90
     target_conf_mode: Literal["maxprob", "entropy"] = "maxprob"
     target_conf_min_count: int = 256
+    target_conf_fallback_policy: Literal["lower_thresh", "skip_update", "use_all"] = "lower_thresh"
     max_entropy: Optional[float] = None
     ema_constraints: float = 0.0
     update_frequency: UpdateFrequency = "epoch"
@@ -85,10 +86,12 @@ class MEIIS(Algorithm):
 
         self.last_iis_history: list[IISIterationStats] = []
         self.ess_history: list[float] = []
+        self._constraint_info_logged: bool = False
+        self._loss_info_logged: bool = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.extract_features(x)
-        return self.classifier(feats)
+        return self.classify_from_features(feats)
 
     def parameter_groups(self) -> Iterable[Dict[str, Any]]:
         return [
@@ -111,24 +114,55 @@ class MEIIS(Algorithm):
 
         logits = self.forward(batch.x)
         per_sample = F.cross_entropy(logits, batch.y, reduction="none")
+        loss_unweighted = per_sample.mean()
 
         loss: torch.Tensor
         if batch.idx is None or self.source_weights.numel() == 0:
-            loss = per_sample.mean()
+            loss = loss_unweighted
+            loss_weighted = loss_unweighted
         else:
             idx_cpu = batch.idx.detach().cpu().to(torch.long)
             w = self.source_weights[idx_cpu].to(device=per_sample.device, dtype=per_sample.dtype)
+            if not torch.isfinite(w).all():
+                raise RuntimeError("MEIIS batch weights contain non-finite values.")
+            if torch.any(w < 0):
+                raise RuntimeError("MEIIS batch weights contain negative values.")
+
             denom = w.sum().clamp_min(1e-12)
             if self.cfg.normalize_weights == "batch":
-                loss = (w * per_sample).sum() / denom
+                loss_weighted = (w * per_sample).sum() / denom
+            elif self.cfg.normalize_weights == "global":
+                # Global policy: weights sum to 1 over the full source set. With uniform minibatch
+                # sampling, E[sum_batch w] = B/N, so scale by N/B for a stable estimate.
+                N = float(self.source_weights.numel())
+                B = float(per_sample.numel())
+                loss_weighted = (w * per_sample).sum() * (N / max(1.0, B))
             else:
-                # global weights already sum to 1; normalize for stable batch scaling.
-                loss = (w * per_sample).sum() / denom
+                raise ValueError(
+                    f"Unknown normalize_weights='{self.cfg.normalize_weights}'. Expected 'batch' or 'global'."
+                )
+            loss = loss_weighted
+            if bool(self.cfg.debug) and not self._loss_info_logged:
+                w_min = float(w.min().detach().cpu().item())
+                w_max = float(w.max().detach().cpu().item())
+                is_uniform = abs(w_max - w_min) <= 1e-12
+                diff = float(loss_weighted.detach().cpu().item() - loss_unweighted.detach().cpu().item())
+                print(
+                    "[MEIIS][loss] "
+                    f"normalize={self.cfg.normalize_weights} "
+                    f"unweighted={float(loss_unweighted.detach().cpu().item()):.6f} "
+                    f"weighted={float(loss_weighted.detach().cpu().item()):.6f} "
+                    f"diff={diff:.6f} "
+                    f"w_min={w_min:.3e} w_max={w_max:.3e} uniform={is_uniform}"
+                )
+                self._loss_info_logged = True
 
         acc = (logits.argmax(dim=1) == batch.y).float().mean()
         return {
             "loss": loss,
             "loss_cls": loss.detach(),
+            "loss_unweighted": loss_unweighted.detach(),
+            "loss_weighted": loss_weighted.detach(),
             "acc": acc.detach(),
             "batch_size": int(batch.x.shape[0]),
         }
@@ -155,6 +189,14 @@ class MEIIS(Algorithm):
         try:
             if epoch is not None:
                 print(f"[MEIIS] update_importance_weights epoch={int(epoch)} model_mode=eval was_training={was_training}")
+            if not self._constraint_info_logged:
+                feat_key = self._feature_layer or "UNKNOWN"
+                print(
+                    "[MEIIS] "
+                    f"constraint_features_key={feat_key} adapter_layers=[{self.layer_name}] "
+                    f"K={int(self.cfg.K)} conf_mode={self.cfg.target_conf_mode} tau={float(self.cfg.target_conf_thresh)}"
+                )
+                self._constraint_info_logged = True
             use_conf = bool(self.cfg.use_confidence_filtered_constraints)
             conf_mode = str(self.cfg.target_conf_mode)
             if conf_mode not in {"maxprob", "entropy"}:
@@ -166,6 +208,12 @@ class MEIIS(Algorithm):
 
             fallback_used = False
             fallback_policy = "none"
+            fallback_policy_cfg = str(self.cfg.target_conf_fallback_policy)
+            if fallback_policy_cfg not in {"lower_thresh", "skip_update", "use_all"}:
+                raise ValueError(
+                    f"Unknown target_conf_fallback_policy='{fallback_policy_cfg}'. "
+                    "Expected 'lower_thresh', 'skip_update', or 'use_all'."
+                )
 
             def _compute_conf_ent(probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
                 conf = probs.max(dim=1).values
@@ -241,14 +289,23 @@ class MEIIS(Algorithm):
 
             if use_conf and kept_fit < min_keep:
                 fallback_used = True
-                fallback_policy = "lower_threshold"
-                tau_used = _tau_for_min_count(scores_all, min_count=min_keep)
-                feats_fit, probs_fit, _scores2, kept_fit, _total2 = _collect_fit(tau=tau_used, force_all=False)
-
-            if kept_fit < min_keep:
-                fallback_used = True
-                fallback_policy = "use_all"
-                feats_fit, probs_fit, _scores3, kept_fit, _total3 = _collect_fit(tau=tau_used, force_all=True)
+                fallback_policy = str(fallback_policy_cfg)
+                if fallback_policy_cfg == "skip_update":
+                    return {
+                        "status": "skipped_low_target_count",
+                        "reason": "fit",
+                        "tau_initial": float(tau_initial),
+                        "tau_used": float(tau_used),
+                        "target_total": int(total_fit),
+                        "target_selected_fit": int(kept_fit),
+                        "fallback_used": True,
+                        "fallback_policy": str(fallback_policy),
+                    }
+                if fallback_policy_cfg == "use_all":
+                    feats_fit, probs_fit, _scores2, kept_fit, _total2 = _collect_fit(tau=tau_used, force_all=True)
+                else:  # lower_thresh
+                    tau_used = _tau_for_min_count(scores_all, min_count=min_keep)
+                    feats_fit, probs_fit, _scores2, kept_fit, _total2 = _collect_fit(tau=tau_used, force_all=False)
 
             if feats_fit.numel() == 0:
                 return {
@@ -313,22 +370,52 @@ class MEIIS(Algorithm):
 
             if use_conf and target_count < min_keep:
                 fallback_used = True
-                fallback_policy = "use_all"
-                feats_fit, probs_fit, _scores4, kept_fit, _total4 = _collect_fit(tau=tau_used, force_all=True)
-                if feats_fit.numel() == 0:
+                fallback_policy = str(fallback_policy_cfg)
+                if fallback_policy_cfg == "skip_update":
                     return {
-                        "status": "skipped_no_target_for_fit",
+                        "status": "skipped_low_target_count",
+                        "reason": "moments",
                         "tau_initial": float(tau_initial),
                         "tau_used": float(tau_used),
                         "target_total": int(target_total),
-                        "target_selected_fit": int(kept_fit),
+                        "target_selected": int(target_count),
                         "fallback_used": True,
                         "fallback_policy": str(fallback_policy),
+                        "target_dropped_nonfinite": int(dropped_nonfinite),
                     }
-                self.adapter.fit_target_structure({self.layer_name: feats_fit}, target_class_probs=probs_fit)
-                target_moments_sum, target_count, target_total, dropped_nonfinite, target_joint_keep = _collect_target_moments(
-                    tau=tau_used, force_all=True
-                )
+                if fallback_policy_cfg == "use_all":
+                    feats_fit, probs_fit, _scores4, kept_fit, _total4 = _collect_fit(tau=tau_used, force_all=True)
+                    if feats_fit.numel() == 0:
+                        return {
+                            "status": "skipped_no_target_for_fit",
+                            "tau_initial": float(tau_initial),
+                            "tau_used": float(tau_used),
+                            "target_total": int(target_total),
+                            "target_selected_fit": int(kept_fit),
+                            "fallback_used": True,
+                            "fallback_policy": str(fallback_policy),
+                        }
+                    self.adapter.fit_target_structure({self.layer_name: feats_fit}, target_class_probs=probs_fit)
+                    target_moments_sum, target_count, target_total, dropped_nonfinite, target_joint_keep = _collect_target_moments(
+                        tau=tau_used, force_all=True
+                    )
+                else:  # lower_thresh
+                    tau_used = _tau_for_min_count(scores_all, min_count=min_keep)
+                    feats_fit, probs_fit, _scores4, kept_fit, _total4 = _collect_fit(tau=tau_used, force_all=False)
+                    if feats_fit.numel() == 0:
+                        return {
+                            "status": "skipped_no_target_for_fit",
+                            "tau_initial": float(tau_initial),
+                            "tau_used": float(tau_used),
+                            "target_total": int(target_total),
+                            "target_selected_fit": int(kept_fit),
+                            "fallback_used": True,
+                            "fallback_policy": str(fallback_policy),
+                        }
+                    self.adapter.fit_target_structure({self.layer_name: feats_fit}, target_class_probs=probs_fit)
+                    target_moments_sum, target_count, target_total, dropped_nonfinite, target_joint_keep = _collect_target_moments(
+                        tau=tau_used, force_all=False
+                    )
 
             if target_moments_sum is None or target_count <= 0:
                 return {
@@ -409,10 +496,20 @@ class MEIIS(Algorithm):
                 weights = mix_alpha * weights + (1.0 - mix_alpha) * uniform
                 weights = weights / weights.sum().clamp_min(1e-12)
 
+            if weights.numel() != int(n_source):
+                raise RuntimeError(f"Expected {n_source} ME-IIS weights, got {weights.numel()}.")
+            if not torch.isfinite(weights).all():
+                raise RuntimeError("ME-IIS weights contain non-finite values after normalization.")
+            if torch.any(weights < 0):
+                raise RuntimeError("ME-IIS weights contain negative values after normalization.")
+            if abs(float(weights.sum().item()) - 1.0) > 1e-6:
+                raise RuntimeError(f"ME-IIS weights do not sum to 1 (sum={float(weights.sum().item())}).")
+
             self.source_weights = weights.to(dtype=torch.float64)
             self.last_iis_history = list(history)
 
-            ess = float(1.0 / torch.sum(self.source_weights**2).clamp_min(1e-12).item())
+            sum_w = float(self.source_weights.sum().item())
+            ess = float((sum_w * sum_w) / torch.sum(self.source_weights**2).clamp_min(1e-12).item())
             self.ess_history.append(ess)
             w_entropy = float(-(self.source_weights * torch.log(self.source_weights + 1e-12)).sum().item())
 
@@ -421,7 +518,8 @@ class MEIIS(Algorithm):
             top_w = self.source_weights[torch.as_tensor(top_idx, dtype=torch.long)].cpu().tolist()
 
             obj_hist = [float(h.objective) for h in history]
-            obj_decreased = any(curr + 1e-10 < prev for prev, curr in zip(obj_hist, obj_hist[1:]))
+            obj_warn_tol = 1e-8
+            obj_decreased = any(curr + obj_warn_tol < prev for prev, curr in zip(obj_hist, obj_hist[1:]))
             last = history[-1] if history else None
 
             ratio = float(target_count) / float(max(1, target_total))
@@ -469,6 +567,63 @@ class MEIIS(Algorithm):
                 f"w_max={float(self.source_weights.max().item()):.3e} "
                 f"iis_max_err={float(last.max_moment_error) if last is not None else float('nan'):.3e}"
             )
+
+            if run_dir is not None:
+                try:
+                    diag_dir = Path(run_dir) / "diagnostics"
+                    diag_dir.mkdir(parents=True, exist_ok=True)
+
+                    w_np = self.source_weights.detach().cpu().numpy()
+                    p50, p90, p99 = (float(x) for x in np.percentile(w_np, [50, 90, 99]))
+
+                    weights_summary = {
+                        "epoch": None if epoch is None else int(epoch),
+                        "n_source": int(self.source_weights.numel()),
+                        "normalize_weights": str(self.cfg.normalize_weights),
+                        "sum": float(self.source_weights.sum().item()),
+                        "min": float(self.source_weights.min().item()),
+                        "mean": float(self.source_weights.mean().item()),
+                        "p50": p50,
+                        "p90": p90,
+                        "p99": p99,
+                        "max": float(self.source_weights.max().item()),
+                        "entropy": float(w_entropy),
+                        "ess": float(ess),
+                        "topk_idx": top_idx,
+                        "topk_w": top_w,
+                    }
+                    (diag_dir / "weights_summary.json").write_text(
+                        json.dumps(weights_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+
+                    iis_hist_rows = [
+                        {
+                            "iter": int(i + 1),
+                            "objective": float(h.objective),
+                            "delta_norm": float(h.delta_norm),
+                            "kl_moments": float(h.kl_moments),
+                            "max_moment_error": float(h.max_moment_error),
+                            "mean_moment_error": float(h.mean_moment_error),
+                            "l2_moment_error": float(h.l2_moment_error),
+                            "num_unachievable_constraints": int(h.num_unachievable_constraints),
+                        }
+                        for i, h in enumerate(history)
+                    ]
+                    iis_history = {
+                        "epoch": None if epoch is None else int(epoch),
+                        "iis_iters_requested": int(self.cfg.max_iis_iters),
+                        "iis_iters": int(len(history)),
+                        "objective_decreased": bool(obj_decreased),
+                        "objective_warn_tol": float(obj_warn_tol),
+                        "history": iis_hist_rows,
+                    }
+                    (diag_dir / "iis_history.json").write_text(
+                        json.dumps(iis_history, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    )
+                except Exception as exc:
+                    if bool(self.cfg.debug):
+                        raise
+                    print(f"[MEIIS][WARN] Failed to write diagnostics: {exc}")
 
             return {
                 "status": "updated",

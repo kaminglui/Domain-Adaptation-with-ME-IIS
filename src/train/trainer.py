@@ -57,13 +57,17 @@ def eval_wilds_split(
     loader: Any,
     dataset: Any,
     device: torch.device,
+    max_batches: int = 0,
 ) -> Dict[str, Any]:
     algorithm.eval()
     y_pred_logits = []
     y_true = []
     metadata = []
 
+    batches_seen = 0
     for batch_raw in loader:
+        if int(max_batches) > 0 and batches_seen >= int(max_batches):
+            break
         batch = unpack_wilds_batch(batch_raw)
         x = batch.x.to(device, non_blocking=True)
         logits = algorithm.predict(x)  # type: ignore[attr-defined]
@@ -72,6 +76,7 @@ def eval_wilds_split(
             y_true.append(batch.y.detach().cpu())
         if batch.metadata is not None:
             metadata.append(batch.metadata.detach().cpu())
+        batches_seen += 1
 
     y_pred_logits_t = torch.cat(y_pred_logits, dim=0)
     y_true_t = torch.cat(y_true, dim=0) if y_true else None
@@ -246,6 +251,45 @@ def _clone_dataloader_with_batch_size(loader: Any, *, batch_size: int) -> Any:
         return loader
 
 
+def _subset_dataloader(loader: Any, *, max_samples: int) -> Any:
+    """
+    Best-effort DataLoader subset wrapper for dry runs.
+
+    Keeps the first `max_samples` samples by index to preserve determinism and
+    keep `WithIndexDataset` indices in-range for ME-IIS weighting.
+    """
+    if int(max_samples) <= 0:
+        return loader
+    try:
+        import torch.utils.data as tud  # local import to avoid importing torch.utils at module import time
+
+        ds = loader.dataset
+        n = len(ds)
+        if int(n) <= int(max_samples):
+            return loader
+
+        subset = tud.Subset(ds, list(range(int(max_samples))))
+        kwargs: Dict[str, Any] = {
+            "batch_size": int(getattr(loader, "batch_size", 1) or 1),
+            "num_workers": int(getattr(loader, "num_workers", 0)),
+            "pin_memory": bool(getattr(loader, "pin_memory", False)),
+            "drop_last": bool(getattr(loader, "drop_last", False)),
+            "shuffle": False,
+            "collate_fn": getattr(loader, "collate_fn", None),
+        }
+        if kwargs["collate_fn"] is None:
+            kwargs.pop("collate_fn", None)
+        if int(kwargs["num_workers"]) > 0:
+            kwargs["persistent_workers"] = bool(getattr(loader, "persistent_workers", False))
+            prefetch = getattr(loader, "prefetch_factor", None)
+            if prefetch is not None:
+                kwargs["prefetch_factor"] = int(prefetch)
+
+        return tud.DataLoader(subset, **kwargs)
+    except Exception:
+        return loader
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     if isinstance(exc, torch.cuda.OutOfMemoryError):
         return True
@@ -280,8 +324,10 @@ def train(
     best_path = run_dir / "best.pt"
     last_path = run_dir / "last.pt"
     results_path = run_dir / "results.json"
+    metrics_path = run_dir / "metrics.json"
     cfg_path = run_dir / "config.json"
     fp_path = run_dir / "config_fingerprint.txt"
+    fp_alt_path = run_dir / "fingerprint.txt"
 
     force_rerun = bool(cfg_local.get("force_rerun", False))
     current_fp = fingerprint_config(cfg_local)
@@ -302,6 +348,7 @@ def train(
 
     _save_json(cfg_path, cfg_local)
     fp_path.write_text(current_fp + "\n", encoding="utf-8")
+    fp_alt_path.write_text(current_fp + "\n", encoding="utf-8")
 
     seed = int(cfg_local.get("seed", 0))
     deterministic = bool(cfg_local.get("deterministic", True))
@@ -310,11 +357,40 @@ def train(
     device = torch.device(cfg_local.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     algorithm.to(device)
 
+    if device.type == "cuda":
+        # Speed vs determinism: benchmark can improve throughput but may introduce nondeterminism.
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = not bool(deterministic)
+        print(
+            f"[cudnn] benchmark={bool(torch.backends.cudnn.benchmark)} "
+            f"deterministic={bool(torch.backends.cudnn.deterministic)}"
+        )
+
     amp_enabled = bool(cfg_local.get("amp", True)) and device.type == "cuda"
     scaler: Optional[torch.cuda.amp.GradScaler] = (
         torch.cuda.amp.GradScaler(enabled=amp_enabled) if device.type == "cuda" else None
     )
     autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp_enabled else nullcontext()
+
+    # --- Dry run caps (smoke tests / debug)
+    dry_run_max_batches = int(cfg_local.get("dry_run_max_batches", 0) or 0)
+    dry_run_max_samples = int(cfg_local.get("dry_run_max_samples", 0) or 0)
+    if dry_run_max_samples <= 0 and dry_run_max_batches > 0:
+        bs_cfg = cfg_local.get("batch_size", 1)
+        bs_int = 1 if isinstance(bs_cfg, str) else int(bs_cfg or 1)
+        dry_run_max_samples = int(dry_run_max_batches) * max(1, int(bs_int))
+    if dry_run_max_samples > 0:
+        print(
+            f"[DRY RUN] Capping loaders to max_samples={dry_run_max_samples} "
+            f"(dry_run_max_batches={dry_run_max_batches})"
+        )
+        train_loader = _subset_dataloader(train_loader, max_samples=dry_run_max_samples)
+        if unlabeled_loader is not None:
+            unlabeled_loader = _subset_dataloader(unlabeled_loader, max_samples=dry_run_max_samples)
+        val_loader = _subset_dataloader(val_loader, max_samples=dry_run_max_samples)
+        test_loader = _subset_dataloader(test_loader, max_samples=dry_run_max_samples)
+        if id_val_loader is not None:
+            id_val_loader = _subset_dataloader(id_val_loader, max_samples=dry_run_max_samples)
 
     # --- Dynamic batch size support (best-effort)
     batch_size_cfg = cfg_local.get("batch_size", None)
@@ -419,12 +495,25 @@ def train(
 
     epochs = int(cfg_local.get("epochs", 1))
     grad_accum_steps = max(1, int(cfg_local.get("grad_accum_steps", 1)))
+    bs = int(getattr(train_loader, "batch_size", 1) or 1)
+    eff_bs = int(bs) * int(grad_accum_steps)
+    print(
+        "[dataloader] "
+        f"batch_size={bs} grad_accum_steps={grad_accum_steps} effective_batch={eff_bs} "
+        f"num_workers={getattr(train_loader, 'num_workers', None)} "
+        f"pin_memory={getattr(train_loader, 'pin_memory', None)} "
+        f"persistent_workers={getattr(train_loader, 'persistent_workers', None)} "
+        f"prefetch_factor={getattr(train_loader, 'prefetch_factor', None)}"
+    )
     log_every = max(1, int(cfg_local.get("log_every", 100)))
     patience = int(cfg_local.get("early_stop_patience", 10))
     best_epoch = start_epoch - 1
     epochs_since_improve = 0
 
     meiis_weight_updates: list[dict[str, Any]] = []
+    disable_checkpointing = bool(cfg_local.get("disable_checkpointing", False))
+    if disable_checkpointing:
+        print("[checkpointing] disabled (disable_checkpointing=True)")
 
     def _iter_unlabeled():
         if unlabeled_loader is None:
@@ -459,6 +548,8 @@ def train(
         step = 0
 
         for batch_raw in train_loader:
+            if dry_run_max_batches > 0 and step >= dry_run_max_batches:
+                break
             unlabeled_batch_raw = next(unlabeled_iter)
             batch = _move_wilds_batch_to_device(batch_raw, device=device)
             unlabeled_batch = (
@@ -524,7 +615,11 @@ def train(
             scheduler.step()
 
         val_metrics = eval_wilds_split(
-            algorithm=algorithm, loader=val_loader, dataset=wilds_dataset, device=device
+            algorithm=algorithm,
+            loader=val_loader,
+            dataset=wilds_dataset,
+            device=device,
+            max_batches=dry_run_max_batches,
         )
         val_acc = _extract_acc(val_metrics)
         if val_acc is None:
@@ -536,8 +631,23 @@ def train(
         if improved:
             best_val = val_acc
             best_epoch = epoch
+            if not disable_checkpointing:
+                _save_ckpt(
+                    best_path,
+                    algorithm=algorithm,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    best_val=best_val,
+                    cfg=cfg_local,
+                )
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
+
+        if not disable_checkpointing:
             _save_ckpt(
-                best_path,
+                last_path,
                 algorithm=algorithm,
                 optimizer=optimizer,
                 scaler=scaler,
@@ -545,19 +655,6 @@ def train(
                 best_val=best_val,
                 cfg=cfg_local,
             )
-            epochs_since_improve = 0
-        else:
-            epochs_since_improve += 1
-
-        _save_ckpt(
-            last_path,
-            algorithm=algorithm,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            best_val=best_val,
-            cfg=cfg_local,
-        )
 
         if patience > 0 and epochs_since_improve >= patience:
             print(
@@ -575,10 +672,18 @@ def train(
     eval_id_val = None
     if id_val_loader is not None:
         eval_id_val = eval_wilds_split(
-            algorithm=algorithm, loader=id_val_loader, dataset=wilds_dataset, device=device
+            algorithm=algorithm,
+            loader=id_val_loader,
+            dataset=wilds_dataset,
+            device=device,
+            max_batches=dry_run_max_batches,
         )
-    eval_val = eval_wilds_split(algorithm=algorithm, loader=val_loader, dataset=wilds_dataset, device=device)
-    eval_test = eval_wilds_split(algorithm=algorithm, loader=test_loader, dataset=wilds_dataset, device=device)
+    eval_val = eval_wilds_split(
+        algorithm=algorithm, loader=val_loader, dataset=wilds_dataset, device=device, max_batches=dry_run_max_batches
+    )
+    eval_test = eval_wilds_split(
+        algorithm=algorithm, loader=test_loader, dataset=wilds_dataset, device=device, max_batches=dry_run_max_batches
+    )
 
     results = {
         "run_id": str(cfg_local.get("run_id", "")),
@@ -595,4 +700,6 @@ def train(
         "wall_time_sec": float(time.time() - t0),
     }
     _save_json(results_path, results)
+    # Convenience alias used by the new CLI/readme ("metrics.json or metrics.csv").
+    _save_json(metrics_path, {"run_id": results.get("run_id"), "metrics": results.get("metrics")})
     return results

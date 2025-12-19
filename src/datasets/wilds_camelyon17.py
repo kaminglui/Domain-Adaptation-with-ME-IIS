@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Mapping, Optional
 
@@ -192,7 +193,39 @@ def build_camelyon17_loaders(config: Mapping[str, Any]) -> Dict[str, Any]:
     if data_root_raw is None or str(data_root_raw).strip() == "":
         data_root = os.environ.get("WILDS_DATA_ROOT")
         if not data_root:
-            data_root = "/content/data/wilds" if is_colab() else os.path.join("datasets", "wilds")
+            if is_colab():
+                local_root = "/content/data/wilds"
+                drive_root = "/content/drive/MyDrive/data/wilds"
+                drive_mounted = os.path.exists("/content/drive/MyDrive")
+                try:
+                    du = shutil.disk_usage("/content")
+                    print(
+                        f"[DATA][DISK] /content total={du.total/1024**3:.1f}GB free={du.free/1024**3:.1f}GB"
+                    )
+                except Exception:
+                    du = None
+                if drive_mounted:
+                    try:
+                        du_drive = shutil.disk_usage("/content/drive/MyDrive")
+                        print(
+                            f"[DATA][DISK] /content/drive/MyDrive total={du_drive.total/1024**3:.1f}GB "
+                            f"free={du_drive.free/1024**3:.1f}GB"
+                        )
+                    except Exception:
+                        du_drive = None
+                else:
+                    du_drive = None
+
+                # Prefer local SSD when it has reasonable headroom; fall back to Drive otherwise.
+                headroom_gb = 15.0
+                local_free_gb = (du.free / 1024**3) if du is not None else 0.0
+                if local_free_gb >= headroom_gb or not drive_mounted:
+                    data_root = local_root
+                else:
+                    data_root = drive_root
+                print(f"[DATA] WILDS root_dir={data_root}")
+            else:
+                data_root = os.path.join("datasets", "wilds")
     else:
         data_root = str(data_root_raw)
     download = bool(config.get("download", True))
@@ -233,7 +266,13 @@ def build_camelyon17_loaders(config: Mapping[str, Any]) -> Dict[str, Any]:
 
     include_indices_in_train = bool(config.get("include_indices_in_train", False))
 
-    num_workers = int(config.get("num_workers", 8))
+    num_workers_raw = config.get("num_workers", 8)
+    if isinstance(num_workers_raw, str) and num_workers_raw.strip().lower() == "auto":
+        cpu = int(os.cpu_count() or 1)
+        num_workers = max(0, min(8, cpu))
+        print(f"[dataloader] num_workers=auto -> {num_workers} (cpu_count={cpu})")
+    else:
+        num_workers = int(num_workers_raw)
     pin_memory = bool(config.get("pin_memory", True))
     persistent_workers = bool(config.get("persistent_workers", True))
     prefetch_factor = int(config.get("prefetch_factor", 2))

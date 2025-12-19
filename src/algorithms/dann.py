@@ -60,7 +60,7 @@ class DANN(Algorithm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.extract_features(x)
-        return self.classifier(feats)
+        return self.classify_from_features(feats)
 
     def update(self, labeled_batch: Any, unlabeled_batch: Any | None = None) -> Dict[str, Any]:
         if unlabeled_batch is None:
@@ -79,7 +79,7 @@ class DANN(Algorithm):
         feats_all = self.extract_features(x_all)
         feats_s = feats_all[: x_s.shape[0]]
 
-        logits_s = self.classifier(feats_s)
+        logits_s = self.classify_from_features(feats_s)
         loss_cls = F.cross_entropy(logits_s, y_s)
         acc = (logits_s.argmax(dim=1) == y_s).float().mean()
 
