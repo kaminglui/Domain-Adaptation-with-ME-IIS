@@ -62,11 +62,13 @@ class _StubWILDSDataset:
         return ds
 
     def eval(self, y_pred, y_true, metadata):  # noqa: ANN001
-        # Minimal accuracy metric.
+        # Minimal accuracy metric; accept either logits or predicted labels.
         y_pred_t = torch.as_tensor(y_pred)
+        if y_pred_t.ndim == 2 and y_pred_t.shape[1] > 1:
+            y_pred_t = y_pred_t.argmax(dim=1)
         y_true_t = torch.as_tensor(y_true)
-        acc = float((y_pred_t.argmax(dim=1) == y_true_t).float().mean().item())
-        return {"acc": acc}
+        acc = float((y_pred_t == y_true_t).float().mean().item())
+        return {"acc_avg": acc}
 
 
 def test_wilds_camelyon17_loader_shapes_and_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,18 +92,22 @@ def test_wilds_camelyon17_loader_shapes_and_metadata(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(mod, "_get_wilds_loaders", _fake_get_loaders)
 
     loaders = build_camelyon17_loaders(
-        data_root="unused",
-        download=False,
-        unlabeled=True,
-        split_mode="align_val",
-        train_transform=None,
-        eval_transform=None,
-        batch_size=4,
-        include_indices_in_train=True,
-        num_workers=0,
+        {
+            "data_root": "unused",
+            "download": False,
+            "unlabeled": True,
+            "split_mode": "align_val",
+            "eval_split": "val",
+            "adapt_split": "val_unlabeled",
+            "train_transform": None,
+            "eval_transform": None,
+            "batch_size": 4,
+            "include_indices_in_train": True,
+            "num_workers": 0,
+        }
     )
 
-    batch = next(iter(loaders.train_loader))
+    batch = next(iter(loaders["train_loader"]))
     assert len(batch) == 4  # x, y, metadata, idx
     x, y, metadata, idx = batch
     assert x.shape == (4, 3, 8, 8)
@@ -110,16 +116,18 @@ def test_wilds_camelyon17_loader_shapes_and_metadata(monkeypatch: pytest.MonkeyP
     assert idx.shape == (4,)
 
     # split_mode=align_val should use val_unlabeled for unlabeled_loader
-    assert loaders.unlabeled_loader is not None
-    assert loaders.unlabeled_loader.dataset is stub.subsets["val_unlabeled"]
+    assert loaders["unlabeled_loader"] is not None
+    assert loaders["unlabeled_loader"].dataset is stub.subsets["val_unlabeled"]
 
 
 class _TinyWildsDS:
     def eval(self, y_pred, y_true, metadata):  # noqa: ANN001
         y_pred_t = torch.as_tensor(y_pred)
+        if y_pred_t.ndim == 2 and y_pred_t.shape[1] > 1:
+            y_pred_t = y_pred_t.argmax(dim=1)
         y_true_t = torch.as_tensor(y_true)
-        acc = float((y_pred_t.argmax(dim=1) == y_true_t).float().mean().item())
-        return {"acc": acc}
+        acc = float((y_pred_t == y_true_t).float().mean().item())
+        return {"acc_avg": acc, "acc_wg": acc}, "stub"
 
 
 class _Tiny3Tuple(torch.utils.data.Dataset):
@@ -206,7 +214,7 @@ def test_checkpoint_skip_logic(tmp_path: Path) -> None:
         unlabeled_loader=None,
         id_val_loader=None,
     )
-    assert res2["status"] == res1["status"]
+    assert res2["status"] == "skipped"
 
 
 def test_me_iis_objective_monotonic_on_toy_data() -> None:
@@ -246,4 +254,3 @@ def test_me_iis_weights_nonnegative_and_not_all_zero() -> None:
     assert torch.all(w >= 0)
     assert float(w.sum().item()) == pytest.approx(1.0, abs=1e-8)
     assert torch.any(w > 0)
-

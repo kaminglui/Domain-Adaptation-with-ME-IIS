@@ -34,6 +34,8 @@ def _format_value(v: Any) -> str:
 _KEY_ORDER: list[tuple[str, str]] = [
     ("dataset", "ds"),
     ("split_mode", "split"),
+    ("eval_split", "eval"),
+    ("adapt_split", "adapt"),
     ("algorithm", "alg"),
     ("backbone", "bb"),
     ("seed", "seed"),
@@ -48,6 +50,8 @@ _KEY_ORDER: list[tuple[str, str]] = [
     # DANN
     ("dann_penalty_weight", "dann"),
     ("grl_lambda", "grl"),
+    ("dann_featurizer_lr_mult", "fmult"),
+    ("dann_discriminator_lr_mult", "dmult"),
     # deepCORAL
     ("coral_penalty_weight", "coral"),
     # ME-IIS
@@ -94,3 +98,12 @@ def decode_run_id_to_config(run_id: str) -> dict[str, Any]:
         out[key] = v
     return out
 
+
+def fingerprint_config(config: Mapping[str, Any]) -> str:
+    """
+    Compute a stable fingerprint for config-safe checkpoint skipping.
+
+    Uses a canonical JSON dump with sorted keys and sha1 hashing.
+    """
+    payload = json.dumps(config, sort_keys=True, default=str, separators=(",", ":"))
+    return sha1(payload.encode("utf-8")).hexdigest()

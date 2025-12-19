@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Literal, Mapping, Optional
+
+from utils.env_utils import is_colab
 
 
 class WithIndexDataset:
@@ -30,6 +33,7 @@ class Camelyon17Splits:
     labeled_train: Any
     labeled_val: Any
     labeled_test: Any
+    unlabeled_train: Optional[Any]
     unlabeled_val: Any
     unlabeled_test: Any
     labeled_id_val: Optional[Any] = None
@@ -41,6 +45,7 @@ class Camelyon17Loaders:
     splits: Camelyon17Splits
     train_loader: Any
     unlabeled_loader: Optional[Any]
+    unlabeled_train_loader: Optional[Any]
     val_loader: Any
     test_loader: Any
     id_val_loader: Optional[Any] = None
@@ -151,6 +156,7 @@ def build_camelyon17_splits(
     labeled_val = dataset.get_subset("val", transform=eval_transform)
     labeled_test = dataset.get_subset("test", transform=eval_transform)
 
+    unlabeled_train = _maybe_get_subset(dataset, "train_unlabeled", transform=eval_transform)
     unlabeled_val = dataset.get_subset("val_unlabeled", transform=eval_transform)
     unlabeled_test = dataset.get_subset("test_unlabeled", transform=eval_transform)
 
@@ -160,47 +166,87 @@ def build_camelyon17_splits(
         labeled_train=labeled_train,
         labeled_val=labeled_val,
         labeled_test=labeled_test,
+        unlabeled_train=unlabeled_train,
         unlabeled_val=unlabeled_val,
         unlabeled_test=unlabeled_test,
         labeled_id_val=labeled_id_val,
     )
 
+SplitMode = Literal["uda_target", "align_val"]
+EvalSplit = Literal["val", "test"]
+AdaptSplit = Literal["val_unlabeled", "test_unlabeled"]
 
-def build_camelyon17_loaders(
-    *,
-    data_root: str,
-    download: bool,
-    unlabeled: bool,
-    split_mode: str,
-    train_transform: Any,
-    eval_transform: Any,
-    batch_size: int,
-    unlabeled_batch_size: Optional[int] = None,
-    include_indices_in_train: bool = False,
-    num_workers: int = 8,
-    pin_memory: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int = 2,
-    loader_kwargs: Optional[Mapping[str, Any]] = None,
-) -> Camelyon17Loaders:
+
+def build_camelyon17_loaders(config: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Build Camelyon17 splits + dataloaders using the official WILDS library.
 
-    split_mode:
-      - "uda_target": labeled train + unlabeled test_unlabeled (hosp5)
-      - "align_val" : labeled train + unlabeled val_unlabeled  (hosp4)
+    Required keys (Phase 1 spec):
+      - split_mode: "uda_target" | "align_val"
+      - eval_split: "val" | "test"
+      - adapt_split: "val_unlabeled" | "test_unlabeled"
+
+    Returns a dict containing the dataset object, subset handles, and loaders.
     """
-    dataset = get_camelyon17_dataset(root_dir=data_root, download=download, unlabeled=unlabeled)
-    splits = build_camelyon17_splits(dataset, train_transform=train_transform, eval_transform=eval_transform)
+    data_root_raw = config.get("data_root", None)
+    if data_root_raw is None or str(data_root_raw).strip() == "":
+        data_root = os.environ.get("WILDS_DATA_ROOT")
+        if not data_root:
+            data_root = "/content/data/wilds" if is_colab() else os.path.join("datasets", "wilds")
+    else:
+        data_root = str(data_root_raw)
+    download = bool(config.get("download", True))
+    unlabeled = bool(config.get("unlabeled", True))
+
+    split_mode: SplitMode = str(config.get("split_mode", "uda_target"))  # type: ignore[assignment]
+    eval_split: EvalSplit = str(config.get("eval_split", "test"))  # type: ignore[assignment]
+    adapt_split: AdaptSplit = str(config.get("adapt_split", "test_unlabeled"))  # type: ignore[assignment]
 
     if split_mode not in {"uda_target", "align_val"}:
         raise ValueError(f"Unknown split_mode='{split_mode}'. Expected 'uda_target' or 'align_val'.")
+    if eval_split not in {"val", "test"}:
+        raise ValueError(f"Unknown eval_split='{eval_split}'. Expected 'val' or 'test'.")
+    if adapt_split not in {"val_unlabeled", "test_unlabeled"}:
+        raise ValueError(
+            f"Unknown adapt_split='{adapt_split}'. Expected 'val_unlabeled' or 'test_unlabeled'."
+        )
 
-    unlabeled_subset = splits.unlabeled_test if split_mode == "uda_target" else splits.unlabeled_val
+    if split_mode == "align_val" and adapt_split != "val_unlabeled":
+        raise ValueError("split_mode='align_val' requires adapt_split='val_unlabeled'.")
+    if split_mode == "align_val" and eval_split != "val":
+        raise ValueError("split_mode='align_val' requires eval_split='val' (debug/ablation only).")
+    if split_mode == "uda_target" and adapt_split != "test_unlabeled":
+        raise ValueError("split_mode='uda_target' requires adapt_split='test_unlabeled'.")
+    if eval_split == "test" and adapt_split == "test_unlabeled" and split_mode != "uda_target":
+        raise ValueError(
+            "Refusing to adapt on test_unlabeled when eval_split='test' unless split_mode='uda_target'."
+        )
+
+    train_transform = config.get("train_transform", None)
+    eval_transform = config.get("eval_transform", None)
+
+    batch_size = int(config.get("batch_size", 0))
+    if batch_size <= 0:
+        raise ValueError("Missing/invalid required config['batch_size'] for Camelyon17.")
+    unlabeled_batch_size = config.get("unlabeled_batch_size", None)
     unlabeled_bs = int(unlabeled_batch_size) if unlabeled_batch_size is not None else int(batch_size)
 
+    include_indices_in_train = bool(config.get("include_indices_in_train", False))
+
+    num_workers = int(config.get("num_workers", 8))
+    pin_memory = bool(config.get("pin_memory", True))
+    persistent_workers = bool(config.get("persistent_workers", True))
+    prefetch_factor = int(config.get("prefetch_factor", 2))
+    loader_kwargs = config.get("loader_kwargs", None) or {}
+
+    dataset = get_camelyon17_dataset(root_dir=data_root, download=download, unlabeled=unlabeled)
+    splits = build_camelyon17_splits(dataset, train_transform=train_transform, eval_transform=eval_transform)
+
+    adapt_subset = splits.unlabeled_val if adapt_split == "val_unlabeled" else splits.unlabeled_test
+    eval_subset = splits.labeled_val if eval_split == "val" else splits.labeled_test
+
     get_train_loader, get_eval_loader = _get_wilds_loaders()
-    extra: Dict[str, Any] = dict(loader_kwargs or {})
+    extra: Dict[str, Any] = dict(loader_kwargs)
 
     labeled_train_ds = WithIndexDataset(splits.labeled_train) if include_indices_in_train else splits.labeled_train
 
@@ -220,14 +266,28 @@ def build_camelyon17_loaders(
         **common_train_kwargs,
         **extra,
     )
-    unlabeled_loader = _call_wilds_loader(
-        get_train_loader,
-        "standard",
-        unlabeled_subset,
-        batch_size=int(unlabeled_bs),
-        **common_train_kwargs,
-        **extra,
-    )
+
+    unlabeled_loader = None
+    if unlabeled:
+        unlabeled_loader = _call_wilds_loader(
+            get_train_loader,
+            "standard",
+            adapt_subset,
+            batch_size=int(unlabeled_bs),
+            **common_train_kwargs,
+            **extra,
+        )
+
+    unlabeled_train_loader = None
+    if unlabeled and splits.unlabeled_train is not None:
+        unlabeled_train_loader = _call_wilds_loader(
+            get_train_loader,
+            "standard",
+            splits.unlabeled_train,
+            batch_size=int(unlabeled_bs),
+            **common_train_kwargs,
+            **extra,
+        )
 
     common_eval_kwargs: Dict[str, Any] = dict(
         num_workers=int(num_workers),
@@ -253,6 +313,14 @@ def build_camelyon17_loaders(
         **common_eval_kwargs,
         **extra,
     )
+    eval_loader = _call_wilds_loader(
+        get_eval_loader,
+        "standard",
+        eval_subset,
+        batch_size=int(batch_size),
+        **common_eval_kwargs,
+        **extra,
+    )
 
     id_val_loader = None
     if splits.labeled_id_val is not None:
@@ -265,12 +333,18 @@ def build_camelyon17_loaders(
             **extra,
         )
 
-    return Camelyon17Loaders(
-        dataset=dataset,
-        splits=splits,
-        train_loader=train_loader,
-        unlabeled_loader=unlabeled_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        id_val_loader=id_val_loader,
-    )
+    return {
+        "dataset": dataset,
+        "splits": splits,
+        "train_loader": train_loader,
+        "unlabeled_loader": unlabeled_loader,
+        "unlabeled_train_loader": unlabeled_train_loader,
+        "val_loader": val_loader,
+        "test_loader": test_loader,
+        "id_val_loader": id_val_loader,
+        "adapt_split": adapt_split,
+        "eval_split": eval_split,
+        "split_mode": split_mode,
+        "adapt_loader": unlabeled_loader,
+        "eval_loader": eval_loader,
+    }

@@ -41,6 +41,45 @@ class Algorithm(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self._feature_info_logged: bool = False
+        self._backbone_name: Optional[str] = None
+        self._backbone_pretrained: Optional[bool] = None
+        self._feature_dim: Optional[int] = None
+        self._feature_layer: Optional[str] = None
+
+    def set_backbone_info(
+        self,
+        *,
+        backbone_name: str,
+        pretrained: bool,
+        feature_dim: int,
+        feature_layer: Optional[str] = None,
+    ) -> None:
+        self._backbone_name = str(backbone_name)
+        self._backbone_pretrained = bool(pretrained)
+        self._feature_dim = int(feature_dim)
+        self._feature_layer = None if feature_layer is None else str(feature_layer)
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        featurizer = getattr(self, "featurizer", None)
+        if featurizer is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no attribute 'featurizer'; cannot compute f(x)."
+            )
+        feats = featurizer(x)
+        if not self._feature_info_logged:
+            bb = self._backbone_name or "UNKNOWN"
+            pt = self._backbone_pretrained
+            feat_dim = self._feature_dim
+            layer = self._feature_layer or "UNKNOWN"
+            mode = "train" if self.training else "eval"
+            shape = tuple(feats.shape)
+            print(
+                f"[features] backbone={bb} pretrained={pt} feat_layer={layer} feature_dim={feat_dim} "
+                f"f(x)_shape={shape} model_mode={mode}"
+            )
+            self._feature_info_logged = True
+        return feats
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError
@@ -59,4 +98,3 @@ class Algorithm(nn.Module):
 
     def on_epoch_end(self, epoch: int, *, device: torch.device) -> Dict[str, Any]:
         return {}
-

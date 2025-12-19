@@ -16,7 +16,7 @@ class ERM(Algorithm):
         self.classifier = nn.Linear(int(feature_dim), int(num_classes))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.featurizer(x)
+        feats = self.extract_features(x)
         return self.classifier(feats)
 
     def update(self, labeled_batch: Any, unlabeled_batch: Any | None = None) -> Dict[str, Any]:
@@ -38,4 +38,3 @@ class ERM(Algorithm):
             {"name": "featurizer", "params": self.featurizer.parameters()},
             {"name": "classifier", "params": self.classifier.parameters()},
         ]
-

@@ -59,7 +59,7 @@ class DANN(Algorithm):
         self.grl_lambda = float(grl_lambda)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.featurizer(x)
+        feats = self.extract_features(x)
         return self.classifier(feats)
 
     def update(self, labeled_batch: Any, unlabeled_batch: Any | None = None) -> Dict[str, Any]:
@@ -76,7 +76,7 @@ class DANN(Algorithm):
         x_t = tgt.x
 
         x_all = torch.cat([x_s, x_t], dim=0)
-        feats_all = self.featurizer(x_all)
+        feats_all = self.extract_features(x_all)
         feats_s = feats_all[: x_s.shape[0]]
 
         logits_s = self.classifier(feats_s)
@@ -112,4 +112,3 @@ class DANN(Algorithm):
             {"name": "classifier", "params": self.classifier.parameters()},
             {"name": "discriminator", "params": self.discriminator.parameters()},
         ]
-
